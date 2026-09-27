@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+# pilot-wp-weblogin --lib DIR [--port N] [--bind ADDR] [--timeout MIN]
+#
+# Temporary login page for pilot-wp-login --web. Serves a form on the local
+# network where the user pastes a browser "Copy as cURL" of a pilot.wp.pl API
+# request (the login itself has to happen on pilot.wp.pl: it is Cloudflare-
+# Turnstile-gated). Each submission is handed to the library (parse_curl_cookies
+# + install_session_cookies), which validates the session against the API before
+# it replaces the jar. Python stdlib only.
+#
+# Safety: a one-time 6-digit code (printed on the box's terminal) must accompany
+# every submission; only clients on private/loopback/link-local addresses are
+# served; MAX_WRONG wrong codes stop the server; it exits after a successful login
+# or after --timeout minutes. Submitted cookies are never logged.
+#
+# Exit codes: 0 logged in, 1 timed out, 3 too many wrong codes, 4 can't listen.
+import argparse, html, ipaddress, secrets, socket, subprocess, sys, time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs
+
+MAX_WRONG = 5
+MAX_BODY = 256 * 1024
+
+# Runs inside the suite's library: parse the submission, then validate + install.
+# Exit: 0 installed, 1 rejected by the API, 2 API unreachable, 9 lib error, 10 no cookies.
+APPLY_SH = r'''
+source "$1/pilot-wp-common.sh" || exit 9
+IFS= read -r mode || exit 10
+if [[ "$mode" == curl ]]; then
+    parsed=$(parse_curl_cookies 2>/dev/null) || exit 10
+    id=${parsed%%$'\t'*}; val=${parsed#*$'\t'}
+else
+    IFS= read -r id || true; IFS= read -r val || true
+    id=$(printf '%s' "$id"   | tr -cd 'A-Za-z0-9._:-')
+    val=$(printf '%s' "$val" | tr -cd 'A-Za-z0-9._-')
+fi
+[[ -n "$id" && -n "$val" ]] || exit 10
+install_session_cookies "$id" "$val"
+'''
+
+RESULT = {
+    1: ("Pilot WP odrzucił te ciasteczka. Zaloguj się ponownie w przeglądarce i skopiuj świeże żądanie.",
+        "Pilot WP rejected these cookies. Log in again in the browser and copy a fresh request."),
+    2: ("Serwer nie może połączyć się z Pilot WP. Sprawdź jego połączenie z internetem i spróbuj ponownie.",
+        "The server can't reach Pilot WP. Check its internet connection and try again."),
+    10: ("Nie znaleziono ciasteczek sesji. Skopiuj żądanie do pilot.wp.pl/api/… (po zalogowaniu), a nie np. obrazek.",
+         "No session cookies found. Copy a request to pilot.wp.pl/api/… (after logging in), not e.g. an image."),
+}
+
+STYLE = """
+body{font:16px/1.5 system-ui,sans-serif;max-width:46rem;margin:2rem auto;padding:0 1rem;color:#1d2330;background:#f6f7f9}
+h1{font-size:1.4rem;line-height:1.3}h1 .en{font-size:.7em;font-weight:500;margin-top:.2rem}
+.en{display:block;color:#5b6475;font-size:.9em;margin-top:.1rem}
+ol>li{margin:.9rem 0}ul{margin:.4rem 0;padding-left:1.2rem}ul li{margin:.4rem 0}
+code,kbd{background:#e6e9ef;padding:0 .3em;border-radius:3px}
+summary{cursor:pointer;font-weight:600}summary .en{font-weight:400}
+.intro{background:#fff;border:1px solid #d8dce4;border-radius:8px;padding:.8rem 1rem}
+form{background:#fff;border:1px solid #d8dce4;border-radius:8px;padding:1rem;margin-top:1.2rem}
+label{display:block;font-weight:600;margin:.6rem 0 .2rem}
+textarea,input{width:100%;box-sizing:border-box;font:14px ui-monospace,monospace;padding:.5rem;border:1px solid #c3c9d4;border-radius:5px}
+textarea{height:9rem}input.code{width:9rem;font-size:1.2rem;letter-spacing:.2em}
+button{margin-top:1rem;padding:.6rem 1.4rem;font-size:1rem;border:0;border-radius:5px;background:#1f6feb;color:#fff;cursor:pointer}
+.err{background:#fde8e8;border:1px solid #f5b5b5;padding:.7rem;border-radius:6px}
+.ok{background:#e6f6ea;border:1px solid #9fd8ad;padding:.9rem;border-radius:6px;font-size:1.1rem}
+details{margin-top:.8rem}
+"""
+
+
+def page(body):
+    return ("<!doctype html><html lang=pl><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Pilot WP – połącz konto / connect account</title><style>" + STYLE + "</style></head><body>"
+            + body + "</body></html>").encode("utf-8")
+
+
+def form_page(error=None):
+    err = ""
+    if error:
+        pl, en = error
+        err = f"<p class=err>{html.escape(pl)}<span class=en>{html.escape(en)}</span></p>"
+    return page(f"""
+<h1>Połącz konto Pilot WP<span class=en>Connect your Pilot WP account</span></h1>
+{err}
+<p class=intro>Będą potrzebne dwie karty przeglądarki: <b>ta karta</b> (ta strona) oraz <b>karta Pilot WP</b> z serwisem pilot.wp.pl.
+Kod do wpisania na końcu odczytasz na <b>serwerze</b> – w terminalu, w którym uruchomiono <code>pilot-wp-login --web</code>.
+<span class=en>You'll need two browser tabs: <b>this tab</b> (this page) and a <b>Pilot WP tab</b> with the pilot.wp.pl site.
+You'll read the code for the last step on the <b>server</b> – in the terminal where <code>pilot-wp-login --web</code> was started.</span></p>
+<ol>
+<li><b>Karta Pilot WP:</b> otwórz <a href="https://pilot.wp.pl" target=_blank rel=noopener>pilot.wp.pl</a> w nowej karcie i zaloguj się na swoje konto (e-mail, hasło i ewentualna weryfikacja „nie jestem robotem”). Nie zamykaj tej karty.
+<span class=en><b>Pilot WP tab:</b> open <a href="https://pilot.wp.pl" target=_blank rel=noopener>pilot.wp.pl</a> in a new tab and log in to your account (email, password and the “I'm not a robot” check if shown). Keep that tab open.</span></li>
+<li><b>Karta Pilot WP:</b> naciśnij <kbd>F12</kbd> (Mac: <kbd>Cmd</kbd>+<kbd>Opt</kbd>+<kbd>I</kbd>). Obok lub pod stroną otworzy się panel narzędzi deweloperskich. U góry tego panelu kliknij zakładkę <b>Network</b> (Chrome – jego narzędzia są po angielsku także w polskiej wersji) albo <b>Sieć</b> (Firefox).
+<span class=en><b>Pilot WP tab:</b> press <kbd>F12</kbd> (Mac: <kbd>Cmd</kbd>+<kbd>Opt</kbd>+<kbd>I</kbd>). The developer tools panel opens beside or below the page. At the top of that panel, click the <b>Network</b> tab.</span></li>
+<li><b>Karta Pilot WP:</b> nie zamykając panelu, kliknij na stronie dowolny kanał (może zacząć się odtwarzanie – to nie szkodzi). W zakładce <b>Network</b> / <b>Sieć</b> pojawią się wiersze. W polu filtra u góry panelu (w Chrome: <b>Filter</b>) wpisz <code>api</code> – zostaną tylko wiersze z adresem zawierającym <code>/api/</code>.
+<span class=en><b>Pilot WP tab:</b> with the panel still open, click any channel on the page (it may start playing – that's fine). Rows appear in the <b>Network</b> tab. Type <code>api</code> into the <b>Filter</b> box at the top of the panel – only rows whose address contains <code>/api/</code> remain.</span></li>
+<li><b>Karta Pilot WP:</b> kliknij prawym przyciskiem myszy dowolny z tych wierszy i wybierz:
+<span class=en><b>Pilot WP tab:</b> right-click any of those rows and choose:</span>
+<ul>
+<li>Chrome: <b>Copy</b> → <b>Copy as cURL (bash)</b> (działa też <b>Copy as cURL (cmd)</b>)
+<span class=en>Chrome: <b>Copy</b> → <b>Copy as cURL (bash)</b> (<b>Copy as cURL (cmd)</b> works too)</span></li>
+<li>Firefox: <b>Kopiuj wartość</b> → <b>Kopiuj jako polecenie cURL (POSIX)</b>
+<span class=en>Firefox: <b>Copy Value</b> → <b>Copy as cURL (POSIX)</b></span></li>
+</ul>
+Tekst trafia do schowka – nic się nie wyświetli.
+<span class=en>The text goes to the clipboard – nothing is shown.</span></li>
+<li><b>Ta karta:</b> wróć tutaj i wklej tekst (<kbd>Ctrl</kbd>+<kbd>V</kbd>; Mac: <kbd>Cmd</kbd>+<kbd>V</kbd>) w pole <b>Skopiowane polecenie cURL</b> poniżej.
+<span class=en><b>This tab:</b> come back here and paste the text (<kbd>Ctrl</kbd>+<kbd>V</kbd>; Mac: <kbd>Cmd</kbd>+<kbd>V</kbd>) into the <b>Copied cURL command</b> box below.</span></li>
+<li><b>Serwer, potem ta karta:</b> odczytaj 6-cyfrowy kod z terminala serwera (wiersz <code>One-time code: …</code>), wpisz go w pole <b>Kod</b> poniżej i kliknij <b>Zaloguj</b>. Po chwili pojawi się „Konto połączone ✓” – kartę Pilot WP możesz wtedy zamknąć.
+<span class=en><b>Server, then this tab:</b> read the 6-digit code in the server's terminal (the <code>One-time code: …</code> line), type it into the <b>Code</b> box below and click <b>Log in</b>. After a moment “Account connected ✓” appears – you can then close the Pilot WP tab.</span></li>
+</ol>
+<form method=post action="/">
+<label for=curl>Skopiowane polecenie cURL (krok 5)<span class=en>Copied cURL command (step 5)</span></label>
+<textarea id=curl name=curl spellcheck=false autocomplete=off placeholder="curl 'https://pilot.wp.pl/api/…' -H 'Cookie: …'"></textarea>
+<details><summary>Albo wpisz dwie wartości ręcznie (zamiast kroków 3–5)<span class=en>Or type the two values by hand (instead of steps 3–5)</span></summary>
+<p><b>Karta Pilot WP</b>, panel narzędzi deweloperskich:
+<span class=en><b>Pilot WP tab</b>, developer tools panel:</span></p>
+<ul>
+<li>Chrome: zakładka <b>Application</b> → po lewej <b>Cookies</b> → <b>https://pilot.wp.pl</b>
+<span class=en>Chrome: <b>Application</b> tab → on the left <b>Cookies</b> → <b>https://pilot.wp.pl</b></span></li>
+<li>Firefox: zakładka <b>Dane</b> → po lewej <b>Ciasteczka</b> → <b>https://pilot.wp.pl</b>
+<span class=en>Firefox: <b>Storage</b> tab → on the left <b>Cookies</b> → <b>https://pilot.wp.pl</b></span></li>
+</ul>
+<p>W tabeli znajdź wiersze <code>netviapisessid</code> i <code>netviapisessval</code> i skopiuj ich zawartość z kolumny <b>Value</b> (Chrome) / <b>Wartość</b> (Firefox) do pól poniżej (wartość <code>netviapisessval</code> jest bardzo długa – skopiuj ją w całości).
+<span class=en>In the table, find the <code>netviapisessid</code> and <code>netviapisessval</code> rows and copy their <b>Value</b> column into the boxes below (the <code>netviapisessval</code> value is very long – copy all of it).</span></p>
+<label for=id>netviapisessid</label><input id=id name=id autocomplete=off spellcheck=false>
+<label for=val>netviapisessval</label><input id=val name=val autocomplete=off spellcheck=false>
+</details>
+<label for=code>Kod z terminala serwera – 6 cyfr (krok 6)<span class=en>Code from the server's terminal – 6 digits (step 6)</span></label>
+<input class=code id=code name=code inputmode=numeric maxlength=6 autocomplete=off required>
+<br><button type=submit>Zaloguj · Log in</button>
+</form>""")
+
+
+def ok_page():
+    return page("""<h1>Pilot WP</h1><p class=ok>Konto połączone ✓ Sesja jest zapisana na serwerze – możesz zamknąć tę stronę.
+<span class=en>Account connected ✓ The session is saved on the server – you can close this page.</span></p>""")
+
+
+def lan_ips():
+    ips = set()
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))          # TEST-NET; UDP connect sends nothing
+        ips.add(s.getsockname()[0]); s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    return sorted(ip for ip in ips if not ip.startswith("127."))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--lib", required=True, help="directory of pilot-wp-common.sh")
+    ap.add_argument("--port", type=int, default=8199)
+    ap.add_argument("--bind", default="0.0.0.0")
+    ap.add_argument("--timeout", type=float, default=15, help="minutes before giving up")
+    args = ap.parse_args()
+
+    code = f"{secrets.randbelow(10**6):06d}"
+    state = {"done": False, "wrong": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "pilot-wp-weblogin"
+        sys_version = ""
+
+        def log_message(self, fmt, *a):          # request line only; never bodies
+            sys.stderr.write("weblogin: %s %s\n" % (self.client_address[0], fmt % a))
+
+        def allowed(self):
+            ip = ipaddress.ip_address(self.client_address[0])
+            if ip.version == 6 and ip.ipv4_mapped:
+                ip = ip.ipv4_mapped
+            return ip.is_private or ip.is_loopback or ip.is_link_local
+
+        def send(self, status, body):
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
+                             "base-uri 'none'; frame-ancestors 'none'")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if not self.allowed():
+                return self.send(403, page("<p>Forbidden</p>"))
+            if self.path not in ("/", "/index.html"):
+                return self.send(404, page("<p>Not found</p>"))
+            self.send(200, form_page())
+
+        def do_POST(self):
+            if not self.allowed():
+                return self.send(403, page("<p>Forbidden</p>"))
+            if self.path != "/":
+                return self.send(404, page("<p>Not found</p>"))
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > MAX_BODY:
+                return self.send(413, form_page(("Za duże lub puste zgłoszenie.", "Empty or too large submission.")))
+            form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"), keep_blank_values=True)
+            get = lambda k: (form.get(k) or [""])[0].strip()
+            if not secrets.compare_digest(get("code").encode(), code.encode()):
+                state["wrong"] += 1
+                left = MAX_WRONG - state["wrong"]
+                return self.send(403, form_page((f"Nieprawidłowy kod (pozostało prób: {left}).",
+                                                  f"Wrong code ({left} attempts left).")))
+            if get("curl"):
+                payload = "curl\n" + get("curl") + "\n"
+            elif get("id") and get("val"):
+                payload = "values\n" + get("id") + "\n" + get("val") + "\n"
+            else:
+                return self.send(400, form_page(RESULT[10]))
+            rc = subprocess.run(["bash", "-c", APPLY_SH, "_", args.lib], input=payload.encode(),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60).returncode
+            if rc == 0:
+                state["done"] = True
+                return self.send(200, ok_page())
+            self.send(400 if rc == 10 else 502, form_page(RESULT.get(rc, (
+                "Błąd wewnętrzny – sprawdź terminal serwera.", "Internal error – check the server's terminal."))))
+
+    HTTPServer.allow_reuse_address = True
+    try:
+        srv = HTTPServer((args.bind, args.port), Handler)
+    except OSError as e:
+        print(f"pilot-wp-login --web: can't listen on {args.bind}:{args.port}: {e}", file=sys.stderr)
+        return 4
+    srv.timeout = 1
+
+    hosts = lan_ips() if args.bind in ("0.0.0.0", "") else [args.bind]
+    print("Open one of these addresses in a browser on your local network:")
+    for h in hosts or ["<this server's IP>"]:
+        print(f"    http://{h}:{args.port}/")
+    print(f"One-time code: {code}   (valid {args.timeout:g} min; Ctrl-C to cancel)", flush=True)
+
+    deadline = time.monotonic() + args.timeout * 60
+    try:
+        while not state["done"] and state["wrong"] < MAX_WRONG and time.monotonic() < deadline:
+            srv.handle_request()
+    except KeyboardInterrupt:
+        print("\ncancelled", file=sys.stderr)
+        return 1
+    finally:
+        srv.server_close()
+    if state["done"]:
+        return 0
+    if state["wrong"] >= MAX_WRONG:
+        print("pilot-wp-login --web: too many wrong codes; stopped.", file=sys.stderr)
+        return 3
+    print("pilot-wp-login --web: timed out; nothing changed.", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

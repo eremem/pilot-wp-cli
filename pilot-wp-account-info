@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# pilot-wp-account-info [--json]
+#
+# Reports the authenticated Pilot WP user's account data and location.
+#
+#   (default)  human-readable summary: identity, personal data, agreements,
+#              subscriptions (active + upcoming), location
+#   --json     raw merged JSON {user, location} on stdout, for scripting
+#
+# Auth is the shared cookie-jar-first cascade (resolve_auth): a valid
+# cookies.txt returns immediately; otherwise credentials / cookie-paste.
+#
+# Data sources (nothing hardcoded that an endpoint provides):
+#   GET /api/v2/user?all=1     -> identity, type, subscriptions, geo, location
+#   GET /api/v1/user/location  -> flag, status, reason, iso_code, is_eu
+#
+# Unofficial port of plugin.video.pilot.wp. Pilot WP is operated by wp.pl.
+set -euo pipefail
+
+JSON=0
+case "${1:-}" in
+    --json)    JSON=1 ;;
+    -h|--help) echo "usage: pilot-wp-account-info [--json]" >&2; exit 0 ;;
+    "")        ;;
+    *)         echo "usage: pilot-wp-account-info [--json]" >&2; exit 64 ;;
+esac
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+resolve_auth
+
+user=$(call_api GET "$USER_URL") \
+    || { echo "pilot-wp-account-info: user request failed (transport)" >&2; exit 4; }
+loc=$(call_api GET "$USER_LOCATION_URL") \
+    || { echo "pilot-wp-account-info: location request failed (transport)" >&2; exit 4; }
+
+# Authorization signal: an unauthenticated session returns {"data":null,...}
+# with no _meta.error.name, so the presence of a numeric .data.id is the check.
+if ! jq -e '.data.id // empty | type == "number"' <<<"$user" >/dev/null 2>&1; then
+    echo "pilot-wp-account-info: not authenticated (session missing or expired)" >&2
+    exit 4
+fi
+
+if [[ "$JSON" == "1" ]]; then
+    # Raw, unconverted values.
+    jq -n --argjson u "$user" --argjson l "$loc" '{user: $u.data, location: $l.data}'
+    exit 0
+fi
+
+# --- human-readable summary ---------------------------------------------------
+# Helpers convert machine-encoded values to readable form.
+fmt_epoch() { # epoch seconds -> local date/time, or — when empty/null/0
+    local e=$1
+    [[ -z "$e" || "$e" == "null" || "$e" == "0" ]] && { printf '—'; return; }
+    date -d "@$e" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$e"
+}
+fmt_money() { # integer minor units -> decimal. No currency is assumed: the API
+              # provides none (only `amount` + `provider`).
+    local a=$1
+    [[ -z "$a" || "$a" == "null" ]] && { printf '—'; return; }
+    printf '%d.%02d' $(( a / 100 )) $(( a % 100 ))
+}
+yn()   { case "$1" in true) printf 'yes';; false) printf 'no';; *) printf '—';; esac; }
+dash() { local v=$1; { [[ -z "$v" || "$v" == "null" ]] && printf '—'; } || printf '%s' "$v"; }
+# jqr (jq -r with CRLF stripped) is provided by pilot-wp-common.sh.
+
+# render_subs ARRAY_KEY — print every subscription under .data.<ARRAY_KEY>
+# (active_subscriptions / upcoming_subscriptions; same object shape). Reads the
+# script-level $user JSON. Prints "(none)" for an empty/absent array.
+render_subs() {
+    local key=$1 n i
+    local -a S
+    n=$(jqr --arg p "$key" '.data[$p] | length' <<<"$user")
+    if [[ "${n:-0}" -eq 0 ]]; then printf '  (none)\n'; return; fi
+    for (( i = 0; i < n; i++ )); do
+        mapfile -t S < <(jqr --argjson i "$i" --arg p "$key" '.data[$p][$i]
+            | (.name, .amount, .starts_at, .ends_at, .is_active_cyclic,
+               .is_canceled, .extendable, .is_try_buy_active)' <<<"$user")
+        printf '  %s\n' "$(dash "${S[0]}")"
+        printf '    price      : %s\n' "$(fmt_money "${S[1]}")"
+        printf '    period     : %s  ->  %s\n' "$(fmt_epoch "${S[2]}")" "$(fmt_epoch "${S[3]}")"
+        printf '    cyclic     : %s\n' "$(yn "${S[4]}")"
+        printf '    extendable : %s\n' "$(yn "${S[6]}")"
+        printf '    try & buy  : %s\n' "$(yn "${S[7]}")"
+        printf '    canceled   : %s\n' "$(yn "${S[5]}")"
+    done
+}
+
+# Extract fields one-per-line with mapfile, not an IFS=$'\t' read: tab is IFS
+# whitespace, so a null field (e.g. location.reason) would collapse and shift
+# the columns; an empty line keeps its slot.
+mapfile -t U < <(jqr '.data | (.login, .id, .type, .login_provider,
+                               .has_password, .created_at, .geo_location,
+                               .location.iso_code, .location.is_eu)' <<<"$user")
+login=${U[0]} uid=${U[1]} utype=${U[2]} provider=${U[3]} haspw=${U[4]}
+created=${U[5]} geo=${U[6]} u_iso=${U[7]} u_eu=${U[8]}
+
+mapfile -t P < <(jqr '.data | (.first_name, .last_name, .nick_name, .avatar_url,
+                               .agreement, .marketing, .mailing, .needs_gdpr,
+                               .agreement_updated_at)' <<<"$user")
+first_name=${P[0]} last_name=${P[1]} nick_name=${P[2]} avatar_url=${P[3]}
+agreement=${P[4]} marketing=${P[5]} mailing=${P[6]} needs_gdpr=${P[7]} agreement_upd=${P[8]}
+
+mapfile -t L < <(jqr '(.data // {}) | (.iso_code, .is_eu, .status,
+                                       .reason, .flag)' <<<"$loc")
+l_iso=${L[0]} l_eu=${L[1]} l_status=${L[2]} l_reason=${L[3]} l_flag=${L[4]}
+
+# Prefer the dedicated location endpoint for geo fields, fall back to the user object.
+iso=$(dash "${l_iso:-$u_iso}")
+eu=$(yn   "${l_eu:-$u_eu}")
+
+printf 'Pilot WP account\n'
+printf '================\n'
+printf '  Login          : %s\n' "$(dash "$login")"
+printf '  User ID        : %s\n' "$(dash "$uid")"
+printf '  Account type   : %s\n' "$(dash "$utype")"
+printf '  Login provider : %s\n' "$(dash "$provider")"
+printf '  Has password   : %s\n' "$(yn "$haspw")"
+printf '  Created        : %s\n' "$(fmt_epoch "$created")"
+
+printf '\nPersonal data\n'
+printf -- '-------------\n'
+printf '  First name     : %s\n' "$(dash "$first_name")"
+printf '  Last name      : %s\n' "$(dash "$last_name")"
+printf '  Nick name      : %s\n' "$(dash "$nick_name")"
+printf '  Avatar URL     : %s\n' "$(dash "$avatar_url")"
+
+printf '\nAgreements\n'
+printf -- '----------\n'
+printf '  Agreement (ToS): %s\n' "$(yn "$agreement")"
+printf '  Marketing      : %s\n' "$(yn "$marketing")"
+printf '  Mailing        : %s\n' "$(yn "$mailing")"
+printf '  Needs GDPR     : %s\n' "$(yn "$needs_gdpr")"
+printf '  Agreement upd. : %s\n' "$(fmt_epoch "$agreement_upd")"
+
+printf '\nSubscriptions\n'
+printf -- '-------------\n'
+render_subs active_subscriptions
+
+printf '\nUpcoming subscriptions\n'
+printf -- '----------------------\n'
+render_subs upcoming_subscriptions
+
+printf '\nLocation\n'
+printf -- '--------\n'
+printf '  Country code   : %s\n' "$iso"
+printf '  In EU          : %s\n' "$eu"
+printf '  Geo location   : %s\n' "$(dash "$geo")"
+printf '  Status         : %s\n' "$(dash "$l_status")"
+printf '  Reason         : %s\n' "$(dash "$l_reason")"
+printf '  Flag           : %s\n' "$(dash "$l_flag")"

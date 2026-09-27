@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# pilot-wp-cdn-probe CHANNEL_ID [N_SEGS]
+#
+# Diagnostic for a DRM channel that stutters (DTS discontinuities, segments fetched
+# slower than real time). It answers: can THIS box pull the channel's DASH segments
+# fast enough to keep up with live, and if not, where does the time go — the data
+# path (link RTT / throughput) or connection setup (TCP/TLS handshake, nf_conntrack)?
+#
+# Run it on the box while a tune is stuttering. It resolves the channel like
+# pilot-wp-stream (cookie jar, fetch_channel, impersonation UA), then times the
+# latest media segments of the top video rendition and the audio, two ways:
+#
+#   WARM  one reused keep-alive connection, as pilot-wp-dashlive uses — WARM ms/seg
+#         must stay under seg_dur (~2s) for smooth playback.
+#   COLD  a fresh connection per segment — isolates connect+handshake cost.
+#
+# WARM and COLD fetch DIFFERENT segments (alternate ones of the same recent run),
+# interleaved in time: neither re-fetches a segment the other just pulled (which the
+# CDN node would serve from cache), and both see the same moment's network. Reading:
+#   COLD slow, WARM fast  => new-connection setup (full nf_conntrack table / socket
+#                            buildup; a reboot clears it)
+#   WARM slow, COLD fast  => long-lived connections stall or get dropped on the way
+#                            (router/NAT/Wi-Fi, or the CDN node) — not bandwidth
+#   both slow             => the link path itself (latency or bandwidth)
+#
+# The slot opened to read the manifest is released immediately. Only DRM channels
+# (status=drm) are probed; free-to-air channels are reported and skipped. Deps: the
+# suite's own (curl, jq) plus python3 stdlib.
+set -euo pipefail
+
+channel_id="${1:?usage: pilot-wp-cdn-probe CHANNEL_ID [N_SEGS]}"
+nseg="${2:-8}"
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/../pilot-wp-common.sh"
+
+# Only fall back to resolve_auth when the jar is missing/empty, so a normal box
+# run stays non-interactive.
+if [[ ! -s "$PILOT_WP_COOKIES" ]]; then
+    resolve_auth || { echo "pilot-wp-cdn-probe: no usable session (run pilot-wp-login)" >&2; exit 1; }
+fi
+
+mapfile -t REC < <(fetch_channel "$channel_id")
+status=${REC[0]:-error}
+token=${REC[4]:-}
+ch_name=${REC[5]:-}
+dash_url=${REC[6]:-}
+# Free the slot at once — we only needed the manifest URL, not a held session.
+[[ -n "$token" ]] && release_stream "$channel_id" "$token" >/dev/null 2>&1 || true
+
+echo "pilot-wp-cdn-probe: channel $channel_id (${ch_name:-?})  status=$status"
+case "$status" in
+    drm) : ;;
+    ok)    echo "  -> free-to-air channel; this probe only targets DRM channels (e.g. TVN). Nothing to do."; exit 0 ;;
+    limit) echo "  -> multiroom limit reached; can't open the channel to read its manifest right now."; exit 0 ;;
+    *)     echo "  -> could not resolve channel (status=$status); is the session valid? try pilot-wp-login." >&2; exit 1 ;;
+esac
+[[ -n "$dash_url" ]] || { echo "  -> no DASH URL in the channel response." >&2; exit 1; }
+echo "  dash_url: $dash_url"
+echo "  UA:       $PILOT_WP_UA"
+echo "  sampling: up to $nseg segments per track for WARM and $nseg different ones for COLD,"
+echo "            interleaved, a couple back from the live edge"
+echo
+
+PY="${PILOT_WP_PYTHON:-python3}"
+"$PY" - "$dash_url" "$PILOT_WP_UA" "$nseg" <<'PY'
+import sys, time, ssl, http.client, urllib.request, urllib.parse
+import xml.etree.ElementTree as ET
+
+dash_url, ua, nseg = sys.argv[1], sys.argv[2], int(sys.argv[3] or "8")
+ln  = lambda t: t.rsplit("}", 1)[-1]
+ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+
+def get_mpd(url):
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    t0 = time.monotonic()
+    with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
+        return r.read(), r.geturl(), time.monotonic() - t0
+
+raw, eff, mpd_t = get_mpd(dash_url)
+root    = ET.fromstring(raw)
+base    = next((e.text.strip() for e in root.iter() if ln(e.tag) == "BaseURL" and e.text), eff)
+periods = [e for e in root.iter() if ln(e.tag) == "Period"]
+period  = periods[-1] if periods else root
+node    = urllib.parse.urlparse(base).netloc
+print(f"node: {node}   MPD fetch {mpd_t*1000:.0f}ms   periods={len(periods)}\n")
+
+def seg_template(aset):
+    tmpl  = next(e for e in aset.iter() if ln(e.tag) == "SegmentTemplate")
+    media = tmpl.attrib["media"]
+    scale = float(tmpl.attrib.get("timescale", "1") or "1")
+    stl   = next(e for e in tmpl.iter() if ln(e.tag) == "SegmentTimeline")
+    times, t, d = [], None, None
+    for s in (e for e in stl.iter() if ln(e.tag) == "S"):
+        if "t" in s.attrib: t = int(s.attrib["t"])
+        d = int(s.attrib["d"]); r = int(s.attrib.get("r", "0"))
+        for _ in range(r + 1):
+            times.append(t); t += d
+    return media, times, (d / scale if d else 2.0)
+
+def hp(media, rep, t):
+    rid, bw = rep.attrib["id"], rep.attrib.get("bandwidth", "0")
+    q = media.replace("$RepresentationID$", rid).replace("$Bandwidth$", bw).replace("$Time$", str(t))
+    u = urllib.parse.urlparse(base + q)
+    return u.netloc, u.path + ("?" + u.query if u.query else "")
+
+def probe(label, aset, rep):
+    media, times, seg_dur = seg_template(aset)
+    # The newest 2*n segments short of the last two (not yet fully published), split
+    # alternately: even ones for WARM, odd ones for COLD. Shrinks n on a short window.
+    usable = times[:-2] if len(times) > 2 else times[:-1]
+    n = max(1, min(nseg, len(usable) // 2))
+    run = usable[-2 * n:]
+    warm_seg, cold_seg = run[0::2], run[1::2]
+    bw = int(rep.attrib.get("bandwidth", "0"))
+    print(f"== {label}  rep id={rep.attrib['id']}  bw={bw/1e6:.3f} Mbps  seg_dur={seg_dur:.2f}s "
+          f"(must fetch each seg in <= {seg_dur:.2f}s to keep up)  n={n} per mode ==")
+
+    # WARM — one reused keep-alive connection (mirrors production dashlive); COLD —
+    # a fresh connection per segment (connect + handshake counted). Interleaved.
+    netloc = hp(media, rep, warm_seg[0])[0]
+    conn = http.client.HTTPSConnection(netloc, timeout=20, context=ctx)
+    wb = wt = wx = 0.0; n_ok = 0; reconnects = 0
+    cc = ct = cx = 0.0; ck = 0; cold_err = 0
+    for tw, tc in zip(warm_seg, cold_seg):
+        path = hp(media, rep, tw)[1]
+        try:
+            t0 = time.monotonic(); conn.request("GET", path, headers={"User-Agent": ua})
+            r = conn.getresponse(); t1 = time.monotonic(); data = r.read(); t2 = time.monotonic()
+        except Exception as e:
+            reconnects += 1
+            try: conn.close()
+            except Exception: pass
+            conn = http.client.HTTPSConnection(netloc, timeout=20, context=ctx)
+            print(f"   warm t={tw}: RECONNECT after {type(e).__name__}: {e}")
+        else:
+            ttfb, xfer = t1 - t0, t2 - t1
+            wb += len(data); wt += ttfb; wx += xfer; n_ok += 1
+            print(f"   warm t={tw}: {len(data)/1024:7.1f} KB  TTFB={ttfb*1000:6.0f}ms  "
+                  f"xfer={xfer*1000:6.0f}ms  total={(ttfb+xfer)*1000:6.0f}ms")
+
+        cnetloc, cpath = hp(media, rep, tc)
+        try:
+            t0 = time.monotonic()
+            c = http.client.HTTPSConnection(cnetloc, timeout=20, context=ctx); c.connect()
+            tC = time.monotonic(); c.request("GET", cpath, headers={"User-Agent": ua})
+            r = c.getresponse(); tH = time.monotonic(); cdata = r.read(); tD = time.monotonic(); c.close()
+        except Exception as e:
+            cold_err += 1
+            print(f"   cold t={tc}: ERROR {type(e).__name__}: {e}")
+        else:
+            cc += tC - t0; ct += tH - tC; cx += tD - tH; ck += 1
+            print(f"   cold t={tc}: {len(cdata)/1024:7.1f} KB  connect={(tC-t0)*1000:5.0f}ms  "
+                  f"TTFB={(tH-tC)*1000:6.0f}ms  xfer={(tD-tH)*1000:6.0f}ms  total={(tD-t0)*1000:6.0f}ms")
+    conn.close()
+
+    k = n_ok or 1
+    warm_per = (wt + wx) / k
+    mbps = wb * 8 / 1e6 / (wt + wx) if (wt + wx) else 0
+    print(f"   WARM avg: TTFB {wt/k*1000:.0f}ms + xfer {wx/k*1000:.0f}ms = {warm_per*1000:.0f}ms/seg "
+          f"({mbps:.1f} Mbps){'  RECONNECTS=' + str(reconnects) if reconnects else ''}")
+    kc = ck or 1
+    cold_per = (cc + ct + cx) / kc
+    print(f"   COLD avg: connect {cc/kc*1000:.0f}ms + TTFB {ct/kc*1000:.0f}ms + xfer {cx/kc*1000:.0f}ms "
+          f"= {cold_per*1000:.0f}ms/seg{'  ERRORS=' + str(cold_err) if cold_err else ''}\n")
+    return dict(label=label, seg_dur=seg_dur, warm=warm_per, cold=cold_per,
+                warm_ttfb=wt/k, warm_xfer=wx/k, reconnects=reconnects,
+                warm_ok=n_ok, cold_ok=ck, cold_err=cold_err)
+
+def first(period, ct):
+    return next((a for a in period.iter()
+                 if ln(a.tag) == "AdaptationSet" and a.attrib.get("contentType") == ct), None)
+
+vset = first(period, "video"); aset = first(period, "audio")
+res = []
+if vset is not None:
+    reps = [e for e in vset.iter() if ln(e.tag) == "Representation"]
+    top  = max(reps, key=lambda r: int(r.attrib.get("bandwidth", "0")))
+    res.append(probe("VIDEO", vset, top))
+    ladder = sorted(int(r.attrib.get("bandwidth", "0")) for r in reps)
+    print("   video ladder (Mbps): " + ", ".join(f"{b/1e6:.3f}" for b in ladder))
+    lower = [b for b in ladder if b < max(ladder)]
+    if lower:
+        print(f"   -> PILOT_WP_DASHLIVE_ARGS=\"--max-video-bw {lower[-1]}\" would drop to the {lower[-1]/1e6:.3f} Mbps rung\n")
+if aset is not None:
+    reps = [e for e in aset.iter() if ln(e.tag) == "Representation"]
+    res.append(probe("AUDIO", aset, reps[0]))
+
+# ---- verdict -----------------------------------------------------------------
+print("VERDICT")
+for r in res:
+    sd = r["seg_dur"]; warm = r["warm"]; cold = r["cold"]; lab = r["label"]
+    if not r["warm_ok"] or not r["cold_ok"]:
+        print(f"  {lab}: not enough successful fetches (WARM {r['warm_ok']}, COLD {r['cold_ok']}) for a "
+              f"verdict — the path is failing outright; run the probe again.")
+        continue
+    if r["reconnects"]:
+        print(f"  {lab}: {r['reconnects']} keep-alive RECONNECT(s) during the run — the connection is "
+              f"being dropped mid-stream (link loss / idle reset). That alone causes stalls.")
+    warm_ok, cold_ok = warm <= sd, cold <= sd
+    if warm_ok and cold_ok:
+        print(f"  {lab}: WARM {warm*1000:.0f}ms/seg and COLD {cold*1000:.0f}ms/seg <= {sd*1000:.0f}ms "
+              f"budget -> keeps up.")
+    elif warm_ok:
+        print(f"  {lab}: WARM {warm*1000:.0f}ms/seg keeps up, BUT COLD {cold*1000:.0f}ms/seg > "
+              f"{sd*1000:.0f}ms budget -> NEW connections are slow; any reconnect stalls. Suspect a full "
+              f"nf_conntrack table / socket buildup (check it; a reboot clears it).")
+    elif cold_ok:
+        print(f"  {lab}: WARM {warm*1000:.0f}ms/seg > {sd*1000:.0f}ms budget, but COLD "
+              f"{cold*1000:.0f}ms/seg keeps up -> fresh connections are fast, the reused one stalls. "
+              f"Bandwidth is fine; long-lived connections are being held up or dropped on the way "
+              f"(router/NAT/Wi-Fi, or the CDN node {node}). Compare from another machine on the same "
+              f"network and re-run to see whether it follows the node.")
+    else:
+        dom = "transfer (bandwidth)" if r["warm_xfer"] > r["warm_ttfb"] else "TTFB/latency (link RTT or server wait)"
+        print(f"  {lab}: WARM {warm*1000:.0f}ms/seg and COLD {cold*1000:.0f}ms/seg > {sd*1000:.0f}ms "
+              f"budget -> CANNOT keep up on any connection. Dominated by {dom}.")
+        if lab == "VIDEO" and r["warm_xfer"] > r["warm_ttfb"]:
+            print(f"          -> capping the video bitrate (--max-video-bw in PILOT_WP_DASHLIVE_ARGS) should help.")
+        else:
+            print(f"          -> a bitrate cap won't fix latency; this is the link/path (compare against a "
+                  f"healthy box or run from elsewhere).")
+PY

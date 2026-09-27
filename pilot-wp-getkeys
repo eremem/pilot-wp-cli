@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# pilot-wp-getkeys WIDEVINE_URL KID_OR_MPD_URL
+#
+# Runs the Widevine license exchange for one Pilot WP channel and prints the
+# content key (lowercase hex, 32 chars) to stdout. All diagnostics go to stderr,
+# so stdout is safe to capture directly into a variable / pipe.
+#
+# The 2nd argument is either the content KID (hex) or the DASH MPD URL. For an
+# http(s) URL, getkeys fetches the manifest itself (UA only, no cookie — the MPD
+# URL is public or carries its own query tokens) and reads the cenc:default_KID.
+#
+# Requires:
+#   PILOT_WP_WVD     path to an L3 Widevine device file (.wvd), chmod 600
+#   PILOT_WP_PYTHON  a python that can `import pywidevine` (defaults to the
+#                    .drmvenv venv, see pilot-wp-common.sh)
+# The pilot.wp.pl session cookies come from the cookie jar and are sent only to
+# the license server, never to the MPD CDN.
+#
+# This is the pywidevine half of the DRM path: pilot-wp-stream's drm) branch calls
+# it and passes the key to run_dash_pipeline, where ffmpeg's mov demuxer decrypts
+# the in-order fragments from pilot-wp-dashlive via -decryption_key.
+set -euo pipefail
+
+wv_url="${1:?usage: pilot-wp-getkeys WIDEVINE_URL KID_OR_MPD_URL}"
+kid_or_mpd="${2:?usage: pilot-wp-getkeys WIDEVINE_URL KID_OR_MPD_URL}"
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+: "${PILOT_WP_WVD:?PILOT_WP_WVD is not set (path to an L3 .wvd)}"
+[[ -r "$PILOT_WP_WVD" ]] || { echo "pilot-wp-getkeys: .wvd not readable: $PILOT_WP_WVD" >&2; exit 1; }
+
+cookie_header="$(cookies_as_header)" \
+ua="$PILOT_WP_UA" \
+x_version="$PILOT_WP_X_VERSION" \
+"$PILOT_WP_PYTHON" - "$wv_url" "$kid_or_mpd" "$PILOT_WP_WVD" <<'PY'
+import os, sys, warnings
+warnings.filterwarnings("ignore")  # silence urllib3 InsecureRequestWarning (verify=False)
+import requests
+import xml.etree.ElementTree as ET
+from pywidevine.cdm import Cdm
+from pywidevine.device import Device
+from pywidevine.pssh import PSSH
+
+wv_url, kid_or_mpd, wvd = sys.argv[1], sys.argv[2], sys.argv[3]
+ua = os.environ.get("ua", "")
+cookie = os.environ.get("cookie_header", "").replace("\r", "").replace("\n", "")
+hdrs = {
+    "User-Agent": ua,
+    "X-Version": os.environ.get("x_version", ""),
+    "Cookie": cookie,
+    "Content-Type": "application/octet-stream",
+    "Accept": "*/*",
+}
+
+def die(msg, code=1):
+    print("pilot-wp-getkeys: %s" % msg, file=sys.stderr)
+    sys.exit(code)
+
+def kid_from_mpd(url):
+    # Fetch the DASH manifest (UA only, no cookie) and return the first
+    # cenc:default_KID (compact lowercase hex), or "" if none.
+    try:
+        raw = requests.get(url, headers={"User-Agent": ua}, verify=False, timeout=20).content
+        root = ET.fromstring(raw)
+    except Exception as e:
+        die("could not fetch/parse MPD for KID: %s: %s" % (type(e).__name__, e), 2)
+    L = lambda t: t.rsplit("}", 1)[-1]
+    for cp in (e for e in root.iter() if L(e.tag) == "ContentProtection"):
+        for k, v in cp.attrib.items():
+            if L(k) == "default_KID":
+                return v.replace("-", "").lower()
+    return ""
+
+kid = kid_from_mpd(kid_or_mpd) if kid_or_mpd[:4].lower() == "http" else kid_or_mpd
+if not kid:
+    die("no KID (could not read cenc:default_KID from the MPD)", 2)
+
+try:
+    device = Device.load(wvd)
+    cdm = Cdm.from_device(device)
+    sid = cdm.open()
+    # Build the PSSH from the KID rather than reading one from the MPD (the
+    # redcdn MPD's Widevine ContentProtection carries no inline PSSH).
+    # privacy_mode=False sends the client_id in clear, which Pilot WP's license
+    # proxy accepts (no service certificate needed).
+    pssh = PSSH.new(system_id=PSSH.SystemId.Widevine, key_ids=[kid])
+    challenge = cdm.get_license_challenge(sid, pssh, privacy_mode=False)
+except Exception as e:
+    die("CDM/challenge error: %s: %s" % (type(e).__name__, e), 3)
+
+try:
+    r = requests.post(wv_url, data=challenge, headers=hdrs, verify=False, timeout=25)
+except Exception as e:
+    die("license POST failed: %s: %s" % (type(e).__name__, e), 4)
+
+if r.status_code != 200 or not r.content:
+    die("license server HTTP %s (%d bytes)" % (r.status_code, len(r.content)), 5)
+
+try:
+    cdm.parse_license(sid, r.content)
+    keys = [k for k in cdm.get_keys(sid) if k.type == "CONTENT"]
+    cdm.close(sid)
+except Exception as e:
+    die("parse_license error: %s: %s" % (type(e).__name__, e), 6)
+
+if not keys:
+    die("license parsed but no CONTENT key returned", 7)
+
+# Prefer the key matching the requested KID; else the first content key.
+kid_l = kid.lower()
+chosen = next((k for k in keys if k.kid.hex.lower() == kid_l), keys[0])
+print("pilot-wp-getkeys: kid=%s key acquired" % chosen.kid.hex, file=sys.stderr)
+print(chosen.key.hex())
+PY

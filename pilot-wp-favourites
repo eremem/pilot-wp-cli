@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# pilot-wp-favourites — list and edit the account's favourite channels.
+#
+#   pilot-wp-favourites [list] [--json]        list favourite channels
+#   pilot-wp-favourites add <id> [<id> …]      add channel(s) to favourites
+#   pilot-wp-favourites remove <id> [<id> …]   remove channel(s) from favourites
+#
+# Channels are addressed by their (stable) channel id — get ids from
+# `pilot-wp-favourites list` or the `pipe://` lines of `pilot-wp-m3u`. Favouriting
+# is reversible and harmless, so add/remove act immediately (no prompt).
+#
+# Data sources (nothing hardcoded that an endpoint provides):
+#   GET    /api/v3/channels/favourites
+#   POST   /api/v1/channels/favourites
+#   DELETE /api/v1/channels/favourites
+#
+# Auth is the shared cookie-jar-first cascade (resolve_auth). Unofficial port of
+# plugin.video.pilot.wp; Pilot WP is operated by wp.pl.
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage:
+  pilot-wp-favourites [list] [--json]        list favourite channels
+  pilot-wp-favourites add <id> [<id> …]      add channel(s) to favourites
+  pilot-wp-favourites remove <id> [<id> …]   remove channel(s) from favourites
+EOF
+}
+
+# --- parse args ---------------------------------------------------------------
+cmd="list"; json=0; ids=()
+args=("$@")
+[[ ${#args[@]} -gt 0 && "${args[0]}" != -* ]] && { cmd="${args[0]}"; args=("${args[@]:1}"); }
+for a in "${args[@]:-}"; do
+    case "$a" in
+        --json)    json=1 ;;
+        -h|--help) usage; exit 0 ;;
+        "")        ;;
+        -*)        echo "pilot-wp-favourites: unknown option: $a" >&2; usage; exit 64 ;;
+        *)         ids+=("$a") ;;
+    esac
+done
+case "$cmd" in
+    list|add|remove) ;;
+    -h|--help)       usage; exit 0 ;;
+    *)               echo "pilot-wp-favourites: unknown command: $cmd" >&2; usage; exit 64 ;;
+esac
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+resolve_auth
+
+# --- list ---------------------------------------------------------------------
+if [[ "$cmd" == list ]]; then
+    resp=$(call_api GET "$FAVOURITES_URL") || { echo "pilot-wp-favourites: API request failed" >&2; exit 4; }
+    jq -e '.data | type == "array"' <<<"$resp" >/dev/null 2>&1 \
+        || { echo "pilot-wp-favourites: unexpected response (not authorized?)" >&2; exit 4; }
+    if [[ "$json" == 1 ]]; then jq '.data' <<<"$resp"; exit 0; fi
+    n=$(jq '.data | length' <<<"$resp")
+    echo "Favourite channels ($n):"
+    [[ "$n" -gt 0 ]] && echo
+    # _meta.categories is an {id:name} object here (the channels/list endpoint uses
+    # an array instead); resolve the primary category id against it.
+    while IFS=$'\t' read -r id name kind cat; do
+        cat=${cat%$'\r'}
+        printf '  [%-4s] %-28s %-6s %s\n' "$id" "$name" "$kind" "$cat"
+    done < <(jqr '
+        (._meta.categories // {}) as $cats
+        | .data[]
+        | [ (.id|tostring),
+            .name,
+            (if .is_audio_only then "Radio" else (.quality // "SD") end),
+            ((.categories[0] // "" | tostring) as $c | $cats[$c] // "Inne")
+          ] | @tsv' <<<"$resp")
+    echo
+    echo "Add:     pilot-wp-favourites add <id> [<id> …]"
+    echo "Remove:  pilot-wp-favourites remove <id> [<id> …]"
+    exit 0
+fi
+
+# --- add / remove -------------------------------------------------------------
+[[ ${#ids[@]} -gt 0 ]] || { echo "pilot-wp-favourites: '$cmd' needs at least one channel id" >&2; usage; exit 64; }
+for id in "${ids[@]}"; do
+    [[ "$id" =~ ^[1-9][0-9]*$ ]] || { echo "pilot-wp-favourites: invalid channel id '$id' (expected a number)" >&2; exit 64; }
+done
+
+# Body: {"channels":[<ids as numbers>]} — same shape POST (add) and DELETE (remove).
+body=$(printf '%s\n' "${ids[@]}" | jq -s '{channels: map(tonumber)}')
+
+case "$cmd" in
+    add)    method=POST  ; verb="Added" ;;
+    remove) method=DELETE; verb="Removed" ;;
+esac
+
+dresp=$(call_api "$method" "$FAVOURITES_EDIT_URL" "$body") \
+    || { echo "pilot-wp-favourites: $cmd request failed" >&2; exit 4; }
+if [[ "$(jqr '.data.status // empty' <<<"$dresp")" == "ok" ]]; then
+    echo "$verb ${#ids[@]} channel(s): ${ids[*]}"
+    exit 0
+fi
+err=$(jqr '._meta.error.name // empty' <<<"$dresp")
+echo "pilot-wp-favourites: $cmd failed${err:+ ($err)}" >&2
+exit 4

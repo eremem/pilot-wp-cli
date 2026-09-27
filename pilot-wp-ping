@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# pilot-wp-ping [-v|--verbose]
+#
+# Cheap, non-interactive keepalive: makes the single cheapest authenticated API
+# call to keep the Pilot WP session warm (and roll it forward) when nothing has
+# streamed for a long time. Designed for cron: quiet by default (cron only mails
+# on a problem); reports the outcome via exit code.
+#
+# --- Why this works (the session is sliding, not a hard JWT expiry) -----------
+# The jar holds two cookies: netviapisessid (a stable opaque id) and
+# netviapisessval (a short-lived ~8h HS512 JWT with an `exp`). The server keys
+# liveness on netviapisessid as a sliding session: every authenticated response
+# carries a Set-Cookie, and periodically (server-side cadence, not per request)
+# it reissues netviapisessval as a fresh JWT and pushes both cookies' expiry ~1
+# year ahead. The JWT `exp` is not a hard limit — the server accepts a val past
+# its `exp` and reissues lazily.
+#
+# So a ping prolongs the session, and this script persists whatever cookie the
+# server returns (CALL_API_SAVE_JAR=1, under the suite PILOT_WP_LOCKFILE flock so it never
+# races a concurrent tune's jar read). Re-run `pilot-wp-login` only if the
+# session is revoked server-side (ping exits 1) or pings stop long enough for it
+# to lapse. With lazy reissue there is no meaningful "exp approaching" warning,
+# so -v just reports the current expiry.
+#
+# --- Cheapest call ------------------------------------------------------------
+# GET /api/v2/user (USER_URL) — the same authenticated probe cookies_authorize
+# uses: a small JSON, no stream slot opened; authorized = a numeric .data.id
+# (an unauthenticated session returns {"data":null}).
+#
+# --- Non-interactive only -----------------------------------------------------
+# Never calls resolve_auth, so it never prompts for a Copy-as-cURL.
+# A missing/invalid jar is reported (exit 1), not fixed. The jar is never wiped
+# on failure (a backup is restored on every non-success path): it is the sole
+# credential and is shared by every tune.
+#
+# --- Exit codes (mirror cookies_authorize's 0/1/2) ----------------------------
+#   0  session alive (and refreshed/persisted).                  -> nothing to do
+#   1  session dead: jar missing/empty, or the API rejected it.  -> pilot-wp-login
+#   2  transport failure: API unreachable / timed out / locked.  -> transient, retry later
+#  64  usage error (bad option).
+#
+# Unofficial port of plugin.video.pilot.wp. Pilot WP is operated by wp.pl.
+set -euo pipefail
+
+VERBOSE=0
+case "${1:-}" in
+    -v|--verbose) VERBOSE=1 ;;
+    -h|--help)    echo "usage: pilot-wp-ping [-v|--verbose]" >&2; exit 0 ;;
+    "")           ;;
+    *)            echo "usage: pilot-wp-ping [-v|--verbose]" >&2; exit 64 ;;
+esac
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+# Knobs (minimal; documented in config.env.example):
+#   PILOT_WP_PING_TIMEOUT  seconds for the single probe request (default 15)
+#   PILOT_WP_PING_LOG      if set, append one timestamped outcome line per run
+PING_TIMEOUT=${PILOT_WP_PING_TIMEOUT:-15}
+PING_LOCKWAIT=20   # seconds to wait for the jar lock before giving up (exit 2)
+PING_LOG=${PILOT_WP_PING_LOG:-}
+
+say()  { echo "pilot-wp-ping: $*" >&2; }                       # always (errors)
+vsay() { [[ "$VERBOSE" == 1 ]] && echo "pilot-wp-ping: $*" >&2 || true; }  # -v only
+logline() {  # append-only audit line, only when PILOT_WP_PING_LOG is set
+    [[ -n "$PING_LOG" ]] || return 0
+    printf '%s pilot-wp-ping %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >> "$PING_LOG" 2>/dev/null || true
+}
+
+# jar_value FILE NAME -> the cookie value (handles curl's "#HttpOnly_" prefix).
+jar_value() {
+    local file=$1 name=$2
+    [[ -f "$file" ]] || return 0
+    awk -F'\t' -v n="$name" '
+        { l=$0; sub(/^#HttpOnly_/,"",l); if (split(l,f,"\t")==7 && f[6]==n) v=f[7] }
+        END { if (v!="") print v }' "$file"
+}
+# jar_expiry FILE NAME -> the cookie expiry epoch (field 5).
+jar_expiry() {
+    local file=$1 name=$2
+    [[ -f "$file" ]] || return 0
+    awk -F'\t' -v n="$name" '
+        { l=$0; sub(/^#HttpOnly_/,"",l); if (split(l,f,"\t")==7 && f[6]==n) v=f[5] }
+        END { if (v!="") print v }' "$file"
+}
+# jwt_exp JWT -> the `exp` epoch from the (base64url) middle segment, or empty.
+jwt_exp() {
+    local jwt=$1 mid m dec
+    mid=$(cut -d. -f2 <<<"$jwt")
+    [[ -n "$mid" ]] || return 0
+    m=$(( ${#mid} % 4 ))
+    (( m > 0 )) && mid="$mid$(printf '%.0s=' $(seq 1 $((4-m))))"
+    dec=$(printf '%s' "$mid" | tr '_-' '/+' | base64 -d 2>/dev/null) || return 0
+    jq -r '.exp // empty' <<<"$dec" 2>/dev/null | tr -d '\r'
+}
+fmt_epoch() { local e=${1:-}; [[ "$e" =~ ^[0-9]+$ ]] && date -u -d "@$e" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || printf 'unknown'; }
+
+# --- Cheap pre-check: a missing/empty jar can't authorize (no network) --------
+if [[ ! -s "$PILOT_WP_COOKIES" ]]; then
+    say "cookie jar is missing or empty ($PILOT_WP_COOKIES); run ./pilot-wp-login"
+    logline "FAIL rc=1 reason=no-jar jar=$PILOT_WP_COOKIES"
+    exit 1
+fi
+
+# --- Serialize the jar refresh under the suite lock ----------------------------
+# We hold the lock across the probe AND the -c write so no concurrent tune reads
+# a half-written jar (call_api's read-only -b can otherwise race a -c rewrite).
+mkdir -p "$(dirname "$PILOT_WP_LOCKFILE")"
+exec 9>"$PILOT_WP_LOCKFILE"
+if ! flock -w "$PING_LOCKWAIT" 9; then
+    say "could not acquire jar lock within ${PING_LOCKWAIT}s ($PILOT_WP_LOCKFILE); another run busy?"
+    logline "FAIL rc=2 reason=lock-timeout"
+    exit 2
+fi
+
+# Back the jar up so any non-success path leaves it byte-identical: curl -c
+# rewrites the jar even on a failed transfer, and an expired session could reply
+# with a session-clearing Set-Cookie.
+backup=$(mktemp) || { say "mktemp failed"; exit 2; }
+trap 'rm -f "$backup" 2>/dev/null' EXIT
+cp -- "$PILOT_WP_COOKIES" "$backup"
+old_val=$(jar_value "$PILOT_WP_COOKIES" netviapisessval)
+
+restore() { cp -f -- "$backup" "$PILOT_WP_COOKIES" && chmod 600 "$PILOT_WP_COOKIES"; }
+
+# --- The single authenticated request (refreshes + persists via -c) -----------
+# Wrapped in `timeout` so a black-holed connection can't hang cron (and hold the
+# lock) forever. The child re-sources the library to reuse call_api; the
+# parent's resolved PILOT_WP_COOKIES/UA/X_VERSION are passed in so the child's `:=`
+# defaults are no-ops and any override (config/env) is honoured.
+resp=$(PILOT_WP_COOKIES="$PILOT_WP_COOKIES" PILOT_WP_UA="$PILOT_WP_UA" PILOT_WP_X_VERSION="$PILOT_WP_X_VERSION" PILOT_WP_HOME="$PILOT_WP_HOME" \
+       CALL_API_SAVE_JAR=1 \
+       timeout "$PING_TIMEOUT" bash -c '
+           source "$1/pilot-wp-common.sh"
+           call_api GET "$2"' _ "$_self_dir" "$USER_URL") && rc=0 || rc=$?
+
+if (( rc != 0 )); then
+    restore
+    say "API unreachable (curl/timeout rc=$rc) — transient; will retry next run"
+    logline "FAIL rc=2 reason=transport curl_rc=$rc"
+    exit 2
+fi
+
+# Unauthenticated = {"data":null} with no _meta.error, so test for the id.
+uid=$(jq -r '.data.id // empty | numbers' <<<"$resp" 2>/dev/null | tr -d '\r' || true)
+if [[ -z "$uid" ]]; then
+    restore                       # may have been sent a session-clearing Set-Cookie
+    say "session not authorized (jar expired or revoked); run ./pilot-wp-login"
+    logline "FAIL rc=1 reason=unauthorized"
+    exit 1
+fi
+
+# Authorized. Sanity-check that the rewritten jar still carries both cookies;
+# if not, restore the backup (valid, just not refreshed) rather than keep a
+# broken jar.
+new_val=$(jar_value "$PILOT_WP_COOKIES" netviapisessval)
+hdr=$(cookies_as_header 2>/dev/null || true)
+if [[ "$hdr" != *netviapisessid=* || "$hdr" != *netviapisessval=* ]]; then
+    say "warning: refreshed jar looked incomplete; kept the previous cookies"
+    restore
+    new_val=$old_val
+fi
+
+# The token value only rotates periodically (server-side); note whether it did.
+rotated=no
+[[ -n "$new_val" && "$new_val" != "$old_val" ]] && rotated=yes
+
+if [[ "$VERBOSE" == 1 ]]; then
+    vsay "session alive (account id=$uid); cookies persisted$([[ $rotated == yes ]] && echo ' (token rotated this run)')"
+    vsay "session token (netviapisessval) valid until $(fmt_epoch "$(jwt_exp "$new_val")")"
+    vsay "session cookie (netviapisessid) expiry  $(fmt_epoch "$(jar_expiry "$PILOT_WP_COOKIES" netviapisessid)")"
+fi
+logline "OK rc=0 id=$uid rotated=$rotated"
+exit 0

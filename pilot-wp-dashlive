@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+# pilot-wp-dashlive --mpd URL --video-fifo PATH --audio-fifo PATH [--audio-fifo PATH …] [opts]
+#   (--audio-fifo is repeatable: one per logical audio track, document order)
+#   --audio-plan --mpd URL   → print one lang per audio track and exit (no streaming)
+#
+# A minimal in-order live-DASH segment fetcher for Pilot WP streams, used for both
+# CENC (DRM) and clear (FTA) channels. ffmpeg's own DASH *live* demuxer can't be
+# used on these dynamic manifests: while draining the timeShiftBuffer it delivers
+# segments out of order, so the muxed MPEG-TS gets non-monotonic DTS and an A/V
+# offset — tolerable for a file/ffplay consumer, but tvheadend's tsfix rejects it
+# (no sound, stalls, client reconnects). Fetching strictly in timeline order
+# yields a clean, monotonic, A/V-aligned stream.
+#
+# This script does not decrypt and sends no Pilot WP cookie — the manifest URL is
+# public (redcdn) or authorised by its own query tokens (videostar). It downloads
+# the init + media segments of one video Representation and of each audio track,
+# in timeline order, and writes each track as a continuous fragmented-MP4 byte
+# stream to its own FIFO. A downstream ffmpeg reads the FIFOs, CENC-decrypts them
+# when given a key (mov -decryption_key), and muxes MPEG-TS.
+#
+# Per-track FIFOs rather than one interleaved stream: video segments are large and
+# audio segments small, so a single writer would have to interleave them or risk
+# ffmpeg blocking on one input while another starves. One writer thread per track
+# lets ffmpeg drain each input independently.
+#
+# It stays --behind segments back from the live edge: the newest segment a
+# dynamic manifest advertises is often not fully written yet, and fetching it
+# yields a short/garbled read (h264 decode errors downstream).
+import argparse, os, queue, re, signal, sys, threading, time, urllib.request, urllib.error
+import xml.etree.ElementTree as ET
+from datetime import datetime
+
+# requests gives HTTP keep-alive / connection reuse, which matters on a
+# bandwidth-limited box: without it every video segment opens a fresh TCP+TLS
+# connection and pays the handshake and TCP slow-start, so the top rendition
+# arrives at barely real-time with no headroom and the player stalls. The DRM
+# .drmvenv has requests (pilot-wp-getkeys imports it); fall back to per-call
+# urllib when it is absent (e.g. FTA or --audio-plan under a bare system python3).
+try:
+    import requests
+except Exception:        # pragma: no cover - stdlib fallback path
+    requests = None
+
+def localname(tag):
+    return tag.rsplit("}", 1)[-1]
+
+def parse_duration(s, default):
+    # ISO-8601 duration like "PT2S" / "PT1M30S" -> seconds (H/M/S fields only).
+    if not s:
+        return default
+    m = re.search(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?", s)
+    if not m:
+        return default
+    h, mi, se = m.groups()
+    return (int(h or 0) * 3600) + (int(mi or 0) * 60) + float(se or 0)
+
+class Fetcher:
+    def __init__(self, args):
+        self.mpd_url = args.mpd
+        self.ua = args.ua
+        self.behind = max(0, args.behind)
+        self.video_fifo = args.video_fifo
+        # One FIFO per logical audio track, in document order (audio track i →
+        # audio_fifos[i]).
+        self.audio_fifos = list(args.audio_fifo or [])
+        self.timeout = args.timeout
+        self.prebuffer = max(0, args.prebuffer)
+        # Video Representation bandwidth cap (bits/s); 0 = no cap (highest). On a
+        # link that only just sustains the top rendition, a lower one buys headroom.
+        self.max_video_bw = max(0, getattr(args, "max_video_bw", 0) or 0)
+        # Preferred video codec as a codecs-string prefix (e.g. "avc1"); "" = none.
+        self.video_codec = (getattr(args, "video_codec", "") or "").strip()
+        # Short connect timeout so a dead/slow peer fails fast and retries on a
+        # fresh connection instead of stalling the whole read timeout.
+        self.connect_timeout = max(0.5, getattr(args, "connect_timeout", 5.0) or 5.0)
+        # 404 retry policy for segments (see _get_segment).
+        self.notfound_retries = max(0, getattr(args, "notfound_retries", 2) or 0)
+        self.notfound_delay = max(0.0, getattr(args, "notfound_delay", 0.5) or 0.0)
+        # Concurrent connections per video track (see _fetch_new); audio is serial.
+        self.parallel = max(1, getattr(args, "parallel", 3) or 1)
+        # Per-thread requests.Session (keep-alive) + the per-thread parallel-fetch
+        # worker pool. threading.local so each track worker (and each pool worker)
+        # reuses its own warm connection without cross-thread locking.
+        self._local = threading.local()
+        # Session-refresh control (token-gated/videostar channels): the bash
+        # session_refresh_loop pushes fresh manifest URLs onto control_fifo (see
+        # control_reader). refresh_pid is that loop's PID, SIGUSR1'd on sustained
+        # segment 403s (see _note_403).
+        self.control_fifo = getattr(args, "control_fifo", None)
+        self.refresh_pid = getattr(args, "refresh_signal_pid", 0) or 0
+        self.refresh_threshold = 3
+        self._403_lock = threading.Lock()
+        self._403_streak = 0
+        self._last_signal = -1e9
+        self._stop = threading.Event()
+        self.verbose = False
+        self.log_tracks = False
+        self._t0 = time.monotonic()
+
+    def log(self, msg):
+        # Diagnostics go to stderr (tvheadend's spawn log via the parent), quiet
+        # unless --verbose, like the bash trace(). Prefixed with seconds-since-start
+        # so the fetch cadence is visible.
+        if self.verbose:
+            sys.stderr.write("pilot-wp-dashlive[%7.2f] %s\n"
+                             % (time.monotonic() - self._t0, msg))
+            sys.stderr.flush()
+
+    def _note_ok(self):
+        # A real segment arrived -> reset the 403 streak.
+        if self.refresh_pid and self._403_streak:
+            with self._403_lock:
+                self._403_streak = 0
+
+    def _note_403(self):
+        # Sustained segment-403s mean the token died before the proactive refresh
+        # (a channel whose TTL is shorter than the refresh interval). Nudge the bash
+        # session_refresh_loop (SIGUSR1) to switch immediately, with a cooldown so we
+        # don't spam it while the switch takes effect.
+        if not self.refresh_pid:
+            return
+        with self._403_lock:
+            self._403_streak += 1
+            now = time.monotonic()
+            if self._403_streak >= self.refresh_threshold and (now - self._last_signal) > 20:
+                self._last_signal = now
+                try:
+                    os.kill(self.refresh_pid, signal.SIGUSR1)
+                    self.log("sustained 403s -> signalled session refresh (pid %d)" % self.refresh_pid)
+                except Exception as e:
+                    self.log("refresh signal failed: %s" % e)
+
+    def control_reader(self):
+        # Daemon thread: read fresh manifest URLs (one per line) pushed by the bash
+        # session_refresh_loop on control_fifo, and swap self.mpd_url for the track
+        # workers to pick up on their next cycle (see track_worker). Re-opens the
+        # FIFO if the writer closes.
+        if not self.control_fifo:
+            return
+        while not self._stop.is_set():
+            try:
+                # readline() (not `for line in cf`) so each URL is delivered the moment
+                # it's written — the file iterator can read-ahead-buffer on a pipe.
+                with open(self.control_fifo, "r") as cf:
+                    while not self._stop.is_set():
+                        line = cf.readline()
+                        if not line:          # writer closed (EOF) -> reopen
+                            break
+                        url = line.strip()
+                        if url and url != self.mpd_url:
+                            self.mpd_url = url   # atomic str rebind (GIL)
+                            self.log("control: session refreshed -> new manifest URL")
+            except Exception as e:
+                self.log("control reader: %s" % e)
+            if self._stop.wait(0.5):
+                return
+
+    def _session(self):
+        # The per-thread keep-alive session (None when requests is unavailable).
+        if requests is None:
+            return None
+        s = getattr(self._local, "session", None)
+        if s is None:
+            s = requests.Session()
+            s.headers["User-Agent"] = self.ua
+            self._local.session = s
+        return s
+
+    def http_get(self, url):
+        # GET url and return the body bytes, over a warm keep-alive connection
+        # when requests is available, else a one-shot urllib request. An HTTP
+        # >=400 is surfaced as urllib's HTTPError so callers catch one type for
+        # both backends. With requests, a connection/timeout error is retried once
+        # on a fresh connection before propagating.
+        s = self._session()
+        if s is not None:
+            last = None
+            for attempt in (0, 1):
+                try:
+                    r = s.get(url, timeout=(self.connect_timeout, self.timeout),
+                              allow_redirects=True)
+                except requests.RequestException as e:
+                    last = e
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                    self._local.session = None
+                    s = self._session()
+                    continue
+                if r.status_code >= 400:
+                    raise urllib.error.HTTPError(url, r.status_code, r.reason, None, None)
+                return r.content
+            raise last if last is not None else RuntimeError("http_get failed")
+        req = urllib.request.Request(url, headers={"User-Agent": self.ua})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            return r.read()
+
+    def fetch_mpd(self):
+        raw = self.http_get(self.mpd_url)
+        root = ET.fromstring(raw)
+        base = None
+        for e in root.iter():
+            if localname(e.tag) == "BaseURL" and e.text:
+                base = e.text.strip()
+                break
+        if base is None:
+            base = self.mpd_url
+        mup = parse_duration(root.attrib.get("minimumUpdatePeriod"), 2.0)
+        return root, base, mup
+
+    def track_sets(self, scope, content_type):
+        # AdaptationSets of a content type within `scope` (a <Period> element or the
+        # whole tree), in document order. contentType first, mimeType prefix as
+        # fallback for manifests that omit contentType.
+        sets = [a for a in scope.iter()
+                if localname(a.tag) == "AdaptationSet"
+                and a.attrib.get("contentType") == content_type]
+        if not sets:
+            sets = [a for a in scope.iter()
+                    if localname(a.tag) == "AdaptationSet"
+                    and a.attrib.get("mimeType", "").startswith(content_type)]
+        return sets
+
+    def adaptation_sets(self, root, content_type):
+        # All AdaptationSets of a content type across the whole document, in document
+        # order. This is the per-index contract for the streaming threads: audio
+        # track i == adaptation_sets[i]. While a DAI ad splice briefly exposes two
+        # Periods, the outgoing Period's sets sort first, so a worker keeps reading
+        # it until it drops and the index then lands on the new Period's set.
+        # Hazard: because this flattens across Periods, during a splice it returns
+        # each logical track once per Period. Never use len() of it to count tracks
+        # — that spawns a phantom worker whose set_index goes out of range when the
+        # splice collapses. Use logical_audio_sets() for counts.
+        return self.track_sets(root, content_type)
+
+    def live_period(self, root):
+        # The live-edge Period: the last <Period> in document order (DASH lists
+        # Periods chronologically) — the layout the stream settles into once a DAI
+        # splice collapses. Falls back to the whole tree when there is no <Period>.
+        periods = [e for e in root.iter() if localname(e.tag) == "Period"]
+        return periods[-1] if periods else root
+
+    def logical_audio_sets(self, root):
+        # Audio AdaptationSets that are distinct logical tracks: scoped to the
+        # live-edge Period, so a DAI 2-Period splice doesn't double-count (see
+        # adaptation_sets). Sizes the audio FIFOs (--audio-plan) and the audio
+        # worker count.
+        return self.track_sets(self.live_period(root), "audio")
+
+    def pick_adaptationset(self, root, content_type, index=0):
+        sets = self.adaptation_sets(root, content_type)
+        if content_type == "video" and self.video_codec:
+            # Keep only the video sets in the preferred codec (codecs is set on the
+            # AdaptationSet or on its Representations); none match -> all sets.
+            def codecs(s):
+                return [s.attrib.get("codecs", "")] + [
+                    e.attrib.get("codecs", "") for e in s.iter()
+                    if localname(e.tag) == "Representation"]
+            preferred = [s for s in sets
+                         if any(c.startswith(self.video_codec) for c in codecs(s))]
+            sets = preferred or sets
+        return sets[index] if 0 <= index < len(sets) else None
+
+    def pick_representation(self, aset, want_highest):
+        reps = [e for e in aset.iter() if localname(e.tag) == "Representation"]
+        if not reps:
+            return None
+        bw = lambda r: int(r.attrib.get("bandwidth", "0"))
+        if want_highest:
+            # Video: highest Representation at or under the bandwidth cap; if every
+            # rep exceeds it, the lowest. cap=0 -> highest. (Audio: the first rep.)
+            if self.max_video_bw > 0:
+                under = [r for r in reps if bw(r) <= self.max_video_bw]
+                return max(under, key=bw) if under else min(reps, key=bw)
+            return max(reps, key=bw)
+        return reps[0]
+
+    def template(self, aset, rep):
+        tmpl = next(e for e in aset.iter() if localname(e.tag) == "SegmentTemplate")
+        rid = rep.attrib["id"]
+        bw = rep.attrib.get("bandwidth", "0")
+        sub = lambda s: s.replace("$RepresentationID$", rid).replace("$Bandwidth$", bw)
+        init_q = sub(tmpl.attrib["initialization"])
+        media_q = sub(tmpl.attrib["media"])
+        return init_q, media_q
+
+    def ast_epoch(self, root):
+        # availabilityStartTime as a UNIX epoch second (for $Number$ live, where
+        # the current segment index is derived from wall clock since the AST).
+        s = root.attrib.get("availabilityStartTime")
+        if not s:
+            return 0.0
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    def list_segments(self, root, aset):
+        # Ordered list of currently-available media segments as (key, pres_sec),
+        # plus the media-template placeholder to substitute and the segment
+        # duration (s). Pilot WP's three manifest flavours use two addressing modes:
+        #   * SegmentTimeline + $Time$ (redcdn DAI, videostar smil): key = <S> t.
+        #     Tracks may use different timescales, so pres_sec normalises via
+        #     (t - presentationTimeOffset)/timescale to keep A/V comparable.
+        #   * SegmentTemplate@duration + $Number$ (number-based live, e.g. Zoom):
+        #     no SegmentTimeline; the index is computed from wall clock since
+        #     availabilityStartTime. key = segment number.
+        # pres_sec is only compared within one channel (all tracks share a mode),
+        # so its absolute origin doesn't matter — only that A and V agree.
+        tmpl = next(e for e in aset.iter() if localname(e.tag) == "SegmentTemplate")
+        ts = float(tmpl.attrib.get("timescale", "1") or "1")
+        pto = float(tmpl.attrib.get("presentationTimeOffset", "0") or "0")
+        media = tmpl.attrib["media"]
+        stl = next((e for e in tmpl.iter() if localname(e.tag) == "SegmentTimeline"), None)
+        if stl is not None and "$Time$" in media:
+            out, t = [], None
+            for s in stl:
+                if localname(s.tag) != "S":
+                    continue
+                if "t" in s.attrib:
+                    t = int(s.attrib["t"])
+                d = int(s.attrib["d"])
+                r = int(s.attrib.get("r", "0"))
+                for _ in range(r + 1):
+                    out.append((t, (t - pto) / ts))
+                    t += d
+            seg_dur = (out[-1][0] - out[-2][0]) / ts if len(out) >= 2 else 2.0
+            return out, "$Time$", seg_dur
+        # $Number$ mode: derive the available index window from the wall clock.
+        dur = float(tmpl.attrib.get("duration", "0") or "0")
+        seg_dur = (dur / ts) if dur else 4.0
+        start_n = int(tmpl.attrib.get("startNumber", "1") or "1")
+        ast = self.ast_epoch(root)
+        tsbd = parse_duration(root.attrib.get("timeShiftBufferDepth"), 60.0)
+        now = time.time()
+        live_n = start_n + int((now - ast) / seg_dur) - 1   # last fully-published
+        first_n = max(start_n, live_n - int(tsbd / seg_dur) + 1)
+        out = [(n, ast + (n - start_n) * seg_dur) for n in range(first_n, live_n + 1)]
+        return out, "$Number$", seg_dur
+
+    def _get_segment(self, url, ct, k, ph):
+        # Fetch one media segment. A 404 is usually a publish race (in the
+        # timeline but not yet written), so retry up to notfound_retries times,
+        # notfound_delay apart — a brief wait instead of a forward DTS gap on
+        # screen. Any other HTTP error (e.g. 403 expired videostar token) is not
+        # a race: skip at once.
+        # Returns the segment bytes, or None to SKIP. A connection/timeout error
+        # propagates (the caller stops the cycle and retries next poll).
+        for tries in range(self.notfound_retries + 1):
+            try:
+                return self.http_get(url)
+            except urllib.error.HTTPError as e:
+                if e.code == 404 and tries < self.notfound_retries and not self._stop.is_set():
+                    self.log(f"{ct}: seg {ph}={k} HTTP 404; retry {tries + 1}/{self.notfound_retries}")
+                    if self._stop.wait(self.notfound_delay):
+                        return None
+                    continue
+                self.log(f"{ct}: seg {ph}={k} HTTP {e.code}; skip")
+                if e.code == 403:
+                    self._note_403()   # token died early -> nudge a refresh (fallback)
+                return None
+        return None
+
+    def _ensure_pool(self, n):
+        # Lazily create this video track thread's persistent parallel-fetch pool:
+        # `n` daemon workers pulling jobs off a queue. Daemon so a fetch in flight
+        # never blocks process exit on teardown; persistent so each worker keeps its
+        # own warm keep-alive connection across cycles. A job is a dict
+        # {url,ct,k,ph,done(Event),result}; the worker fills result then sets done.
+        pool = getattr(self._local, "pool", None)
+        if pool is None:
+            jobs = queue.Queue()
+            def worker():
+                while not self._stop.is_set():
+                    job = jobs.get()
+                    if job is None:
+                        break
+                    try:
+                        data = self._get_segment(job["url"], job["ct"], job["k"], job["ph"])
+                        job["result"] = (("skip", None) if data is None
+                                         else ("notready", None) if data[:5] == b"<?xml"
+                                         else ("ok", data))
+                    except Exception as e:
+                        job["result"] = ("error", e)
+                    job["done"].set()
+            threads = [threading.Thread(target=worker, daemon=True, name="dl-fetch")
+                       for _ in range(n)]
+            for t in threads:
+                t.start()
+            pool = {"jobs": jobs, "threads": threads}
+            self._local.pool = pool
+        return pool
+
+    def _close_pool(self):
+        # Stop this thread's worker pool (poison pills). Any in-flight fetch finishes
+        # in its (daemon) worker and is discarded; nothing blocks process exit.
+        pool = getattr(self._local, "pool", None)
+        if pool is not None:
+            for _ in pool["threads"]:
+                pool["jobs"].put(None)
+            self._local.pool = None
+
+    def _fetch_new(self, f, base, media_q, ph, usable, last_key, ct):
+        # Fetch every usable segment newer than last_key, write them to the FIFO in
+        # order, and return the updated last_key. Video uses up to `parallel`
+        # concurrent connections: the redcdn per-connection rate tops out near the
+        # stream bitrate, so one connection can't stay ahead and segments roll off
+        # the window; concurrency pulls a backlog faster than real time. Audio
+        # segments are small, so they stay serial.
+        todo = [k for (k, sec) in usable if last_key is None or k > last_key]
+        if not todo:
+            return last_key
+        par = self.parallel if ct == "video" else 1
+        if par <= 1:
+            return self._fetch_seq(f, base, media_q, ph, todo, last_key, ct)
+        return self._fetch_par(f, base, media_q, ph, todo, last_key, ct, par)
+
+    def _fetch_seq(self, f, base, media_q, ph, todo, last_key, ct):
+        # Serial fetch (parallel<=1, or audio): one segment at a time.
+        got = 0; nbytes = 0; t_fetch = 0.0
+        for k in todo:
+            if self._stop.is_set():
+                break
+            t0 = time.monotonic()
+            try:
+                data = self._get_segment(base + media_q.replace(ph, str(k)), ct, k, ph)
+            except Exception as e:
+                # Transient fetch error (timeout / connection reset): keep last_key
+                # and the tune; stop this cycle and retry next poll.
+                self.log(f"{ct}: seg {ph}={k} fetch error ({e}); will retry")
+                break
+            if data is None:
+                last_key = k          # 4xx (after any 404 retries) -> skip past it
+                continue
+            if data[:5] == b"<?xml":
+                self.log(f"{ct}: seg {ph}={k} not ready; will retry")
+                break
+            f.write(data); last_key = k; got += 1; self._note_ok()
+            nbytes += len(data); t_fetch += time.monotonic() - t0
+        if got > 1:
+            self.log("%s: +%d segs this cycle (%.1fs fetch, %.0f ms/seg, %.1f MB, %.1f MB/s)"
+                     % (ct, got, t_fetch, 1000 * t_fetch / got, nbytes / 1e6,
+                        (nbytes / 1e6 / t_fetch) if t_fetch > 0 else 0.0))
+        return last_key
+
+    def _fetch_par(self, f, base, media_q, ph, todo, last_key, ct, par):
+        # Parallel fetch: process `todo` in chunks of `par`, fetching each chunk's
+        # segments concurrently (one pool worker + warm connection each) but writing
+        # them to the FIFO strictly in order. Per-job dicts (not a shared index map)
+        # so an orphaned in-flight job on an early stop is simply GC'd — no
+        # cross-cycle collision. At most ~par segments are buffered in RAM at once.
+        pool = self._ensure_pool(par)
+        got = 0; nbytes = 0; t0 = time.monotonic(); i = 0; stop = False
+        while i < len(todo) and not stop and not self._stop.is_set():
+            chunk = todo[i:i + par]
+            jobs = []
+            for k in chunk:
+                job = {"url": base + media_q.replace(ph, str(k)), "ct": ct, "k": k,
+                       "ph": ph, "done": threading.Event(), "result": None}
+                pool["jobs"].put(job); jobs.append(job)
+            for job in jobs:                      # consume strictly in submit order
+                while not job["done"].wait(timeout=0.5):
+                    if self._stop.is_set():
+                        return last_key
+                kind, payload = job["result"]
+                if kind == "ok":
+                    f.write(payload); last_key = job["k"]; self._note_ok()
+                    got += 1; nbytes += len(payload)
+                elif kind == "skip":
+                    last_key = job["k"]           # 4xx (after 404 retries) -> skip past
+                elif kind == "notready":
+                    self.log(f"{ct}: seg {ph}={job['k']} not ready; will retry")
+                    stop = True; break
+                else:  # error
+                    self.log(f"{ct}: seg {ph}={job['k']} fetch error ({payload}); will retry")
+                    stop = True; break
+            i += par
+        t_fetch = time.monotonic() - t0
+        if got > 1:
+            self.log("%s: +%d segs this cycle (%.1fs wall, %.0f ms/seg eff, %.1f MB, %.1f MB/s, par=%d)"
+                     % (ct, got, t_fetch, 1000 * t_fetch / got, nbytes / 1e6,
+                        (nbytes / 1e6 / t_fetch) if t_fetch > 0 else 0.0, par))
+        return last_key
+
+    def track_worker(self, content_type, fifo_path, want_highest,
+                     start_sec=None, root0=None, base0=None, set_index=0):
+        # One thread per track. Opens the FIFO (blocks until ffmpeg opens the read
+        # end), writes the init segment, fetches an initial prebuffer burst, then
+        # polls for new segments at ~one-segment cadence. The initial selection
+        # uses the shared startup snapshot (root0/base0, start_sec) from run() so
+        # all tracks start co-temporal (see startup_probe).
+        try:
+            f = open(fifo_path, "wb", buffering=0)
+        except Exception as e:
+            self.log(f"{content_type}: cannot open fifo {fifo_path}: {e}")
+            self._stop.set()
+            return
+        try:
+            if root0 is not None:
+                root, base = root0, base0
+            else:
+                root, base, _ = self.fetch_mpd()
+            aset = self.pick_adaptationset(root, content_type, set_index)
+            if aset is None:
+                self.log(f"{content_type}[{set_index}]: no adaptation set; stopping")
+                self._stop.set()
+                return
+            rep = self.pick_representation(aset, want_highest)
+            init_q, media_q = self.template(aset, rep)
+            segs, ph, seg_dur = self.list_segments(root, aset)
+            usable = segs[: len(segs) - self.behind] if self.behind else segs
+            self.log(f"{content_type}: rep={rep.attrib.get('id')} "
+                     f"bw={rep.attrib.get('bandwidth')} mode={ph} seg_dur={seg_dur}s "
+                     f"usable={len(usable)}"
+                     + (f" pres[{usable[0][1]:.3f}..{usable[-1][1]:.3f}]" if usable else ""))
+            f.write(self.http_get(base + init_q))
+
+            # Start at the segment nearest the shared start_sec. Keys are monotonic
+            # ($Time$ values or $Number$ indices). No shared start → near the edge.
+            last_key = None
+            if start_sec is not None and usable:
+                chosen = min(usable, key=lambda ks: abs(ks[1] - start_sec))
+                last_key = chosen[0] - 1
+                self.log(f"{content_type}: start pres={chosen[1]:.3f}s (target {start_sec:.3f})")
+            if last_key is None:
+                if len(usable) >= 2:
+                    last_key = usable[-2][0]
+                elif usable:
+                    last_key = usable[0][0] - 1
+
+            # Initial prebuffer burst from the snapshot window.
+            last_key = self._fetch_new(f, base, media_q, ph, usable, last_key, content_type)
+
+            worker_url = self.mpd_url   # the session this worker is currently on
+            absent = False              # our set_index is currently missing from the MPD
+            # Steady state: each thread polls its own fresh manifest once per
+            # segment duration (a shared manifest cache makes delivery bursty).
+            while not self._stop.is_set():
+                cycle_start = time.monotonic()
+                try:
+                    root, base, _ = self.fetch_mpd()
+                    aset = self.pick_adaptationset(root, content_type, set_index)
+                    if aset is None:
+                        # Our set_index momentarily has no AdaptationSet (e.g. a DAI
+                        # Period change shrank the set list). Log once, idle one
+                        # cadence and re-check; the set normally returns. Stay alive:
+                        # run() tears the whole tune down if any track thread exits.
+                        if not absent:
+                            self.log(f"{content_type}[{set_index}]: adaptation set "
+                                     f"absent (DAI period change?); idling until it returns")
+                            absent = True
+                        if self._stop.wait(seg_dur):
+                            break
+                        continue
+                    if absent:
+                        self.log(f"{content_type}[{set_index}]: adaptation set back")
+                        absent = False
+                    if self.mpd_url != worker_url:
+                        # session_refresh_loop pushed a fresh (videostar) session.
+                        # Re-derive the template for the new tokens but don't re-write
+                        # the init segment (same content/codecs/KID, key reused):
+                        # continue media from last_key, since the new manifest carries
+                        # the same timeline.
+                        worker_url = self.mpd_url
+                        rep = self.pick_representation(aset, want_highest)
+                        init_q, media_q = self.template(aset, rep)
+                        self.log(f"{content_type}: session refreshed; continuing from last_key")
+                    segs, ph, seg_dur = self.list_segments(root, aset)
+                except Exception as e:
+                    self.log(f"{content_type}: manifest refresh failed: {e}")
+                    if self._stop.wait(seg_dur):
+                        break
+                    continue
+                usable = segs[: len(segs) - self.behind] if self.behind else segs
+                last_key = self._fetch_new(f, base, media_q, ph, usable, last_key, content_type)
+                # Schedule-pace: hold each cycle to one segment-duration measured
+                # from its START, so per-cycle work doesn't accumulate into drift
+                # and periodic catch-up bursts. Overran cycles don't sleep.
+                dt = seg_dur - (time.monotonic() - cycle_start)
+                if dt > 0:
+                    self._stop.wait(dt)
+        except BrokenPipeError:
+            # ffmpeg (the reader) went away — normal teardown.
+            self.log(f"{content_type}: reader closed (broken pipe); stopping")
+            self._stop.set()
+        except Exception as e:
+            self.log(f"{content_type}: error: {e}")
+            self._stop.set()
+        finally:
+            self._close_pool()
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    def startup_probe(self):
+        # One manifest snapshot at startup, shared by all track threads for their
+        # initial segment selection, so they start co-temporal. Without it the
+        # audio thread, whose FIFO ffmpeg opens a couple of seconds after video's,
+        # would fetch its own later manifest; on a short sliding window that has
+        # already rolled past the video start → a constant A/V offset.
+        # Returns (start_sec, root, base): start_sec is a presentation second
+        # (comparable across timescales) `prebuffer` segments back from the edge,
+        # but never the oldest segment (it may roll off before the audio thread
+        # fetches it). (None, None, None) → per-track fallback selection.
+        try:
+            root, base, _mup = self.fetch_mpd()
+            vset = self.pick_adaptationset(root, "video")
+            self.report_tracks(root, vset)
+            # Reference set for the shared start: video when present, else the first
+            # audio set (audio-only / radio streams have no video AdaptationSet).
+            ref = vset if vset is not None else self.pick_adaptationset(root, "audio")
+            if ref is None:
+                return None, None, None
+            segs, _ph, _sd = self.list_segments(root, ref)
+            usable = segs[: len(segs) - self.behind] if self.behind else segs
+            if not usable:
+                return None, None, None
+            idx = max(0, len(usable) - 1 - self.prebuffer)
+            if idx == 0 and len(usable) >= 2:
+                idx = 1  # keep one segment of back-margin (roll-off / startup slide)
+            start_sec = usable[idx][1]
+            self.log("startup snapshot: start=%.3fs (prebuffer=%d behind=%d usable=%d)"
+                     % (start_sec, self.prebuffer, self.behind, len(usable)))
+            return start_sec, root, base
+        except Exception as e:
+            self.log("startup probe failed (%s); per-track fallback" % e)
+            return None, None, None
+
+    def report_tracks(self, root, vset):
+        # One-line track summary to stderr, in pilot-wp-stream's trace_tracks
+        # format: "video=<v>/<reps> audio=<sent>/<sets>". We stream one video
+        # Representation and one FIFO per logical audio track; <sent> is how many
+        # audio tracks we actually feed (len(audio_fifos), capped to what exists).
+        # Only with --verbose or --log-tracks.
+        if not (self.verbose or self.log_tracks):
+            return
+        try:
+            vreps = sum(1 for e in (vset.iter() if vset is not None else [])
+                        if localname(e.tag) == "Representation")
+            vsent = 1 if (vset is not None and self.video_fifo) else 0
+            asets = len(self.logical_audio_sets(root))
+            sent = min(len(self.audio_fifos), asets) if self.audio_fifos else asets
+            sys.stderr.write("pilot-wp-dashlive: tracks: video=%d/%d audio=%d/%d\n"
+                             % (vsent, vreps, sent, asets))
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def run(self):
+        start_sec, root0, base0 = self.startup_probe()
+        # Count logical audio tracks (startup snapshot, else a fresh fetch) and spawn
+        # one audio thread per (fifo, track) pair: never more threads than tracks
+        # exist, nor more than the caller gave FIFOs for.
+        try:
+            root_for_count = root0 if root0 is not None else self.fetch_mpd()[0]
+            n_sets = len(self.logical_audio_sets(root_for_count))
+        except Exception:
+            n_sets = len(self.audio_fifos)
+        n_audio = min(len(self.audio_fifos), n_sets) if self.audio_fifos else 0
+        if n_audio < len(self.audio_fifos):
+            self.log("warn: %d audio FIFOs but only %d audio set(s); extra FIFOs unused"
+                     % (len(self.audio_fifos), n_audio))
+
+        # Video thread only when a video FIFO was given (audio-only / radio streams
+        # pass no --video-fifo).
+        threads = []
+        if self.video_fifo:
+            threads.append(threading.Thread(
+                target=self.track_worker,
+                args=("video", self.video_fifo, True, start_sec, root0, base0, 0),
+                daemon=True))
+        for i in range(n_audio):
+            threads.append(threading.Thread(
+                target=self.track_worker,
+                args=("audio", self.audio_fifos[i], False, start_sec, root0, base0, i),
+                daemon=True))
+        # Control reader (token-gated channels only). Daemon, and not counted in the
+        # all-alive wait below.
+        if self.control_fifo:
+            threading.Thread(target=self.control_reader, daemon=True, name="dl-control").start()
+        for t in threads:
+            t.start()
+        # Wait until any track stops, then return so the process exits and ffmpeg
+        # sees EOF on every FIFO.
+        while not self._stop.is_set() and all(t.is_alive() for t in threads):
+            time.sleep(0.25)
+        self._stop.set()
+        for t in threads:
+            t.join(timeout=2)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mpd", required=True)
+    ap.add_argument("--video-fifo")
+    # Repeatable: one --audio-fifo per logical audio track, in document order.
+    ap.add_argument("--audio-fifo", action="append")
+    ap.add_argument("--ua", default="pilot")
+    ap.add_argument("--behind", type=int, default=2,
+                    help="segments to stay behind the live edge (default 2)")
+    ap.add_argument("--prebuffer", type=int, default=20,
+                    help="ready segments delivered up-front as a cushion against throughput "
+                         "dips and content-boundary stalls (default 20 = ~40s for 2s segments; "
+                         "self-caps on short videostar windows). Higher = more resilient but "
+                         "more latency-behind-live; lower (e.g. 8) on a stable link for less latency.")
+    ap.add_argument("--timeout", type=float, default=20.0,
+                    help="per-request READ timeout in seconds (default 20)")
+    ap.add_argument("--connect-timeout", type=float, default=5.0,
+                    help="per-request CONNECT timeout in seconds (default 5) — keeps a "
+                         "dead/slow peer from stalling the full read timeout")
+    ap.add_argument("--max-video-bw", type=int, default=0,
+                    help="cap the chosen video Representation at this bandwidth (bits/s); "
+                         "0 = no cap / pick the highest. Use on a thin link to pick a "
+                         "lighter rendition than the 6+ Mbps top one (e.g. 4000000).")
+    ap.add_argument("--video-codec", default="",
+                    help="prefer the video AdaptationSet whose codecs start with this "
+                         "prefix (e.g. avc1) when the MPD offers several; falls back to "
+                         "the first video set if none match. Default: none (first set).")
+    ap.add_argument("--parallel", type=int, default=3,
+                    help="concurrent connections per VIDEO track (default 3). The redcdn "
+                         "per-connection rate barely exceeds the stream bitrate, so one "
+                         "connection can't stay ahead; concurrency pulls a backlog faster "
+                         "than real-time and stops the periodic 1-segment skips. 1 = serial. "
+                         "Audio is always serial.")
+    ap.add_argument("--control-fifo",
+                    help="path to a control FIFO (in /dev/shm) that the bash "
+                         "session_refresh_loop writes fresh manifest URLs to; on each line "
+                         "the track workers swap mpd_url in place (token-gated channels). "
+                         "Omit for token-less channels (no refresh).")
+    ap.add_argument("--refresh-signal-pid", type=int, default=0,
+                    help="PID of the session_refresh_loop to SIGUSR1 on sustained segment "
+                         "403s (reactive fallback — forces an immediate session switch when "
+                         "a token dies before the proactive refresh). 0 = disabled.")
+    ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--log-tracks", action="store_true",
+                    help="emit a one-line 'tracks: video=1/N audio=M/M' summary (no other noise)")
+    ap.add_argument("--audio-plan", action="store_true",
+                    help="print one BCP-47 language tag per LOGICAL audio track (counted "
+                         "within a single Period, so a DAI ad splice's transient extra "
+                         "Period does not double-count) to stdout and exit — used by "
+                         "run_dash_pipeline to size the audio FIFOs and set per-track "
+                         "language metadata. No streaming.")
+    args = ap.parse_args()
+    fetcher = Fetcher(args)
+    fetcher.verbose = args.verbose
+    fetcher.log_tracks = args.log_tracks
+
+    if args.audio_plan:
+        root, _base, _mup = fetcher.fetch_mpd()
+        for a in fetcher.logical_audio_sets(root):
+            print(a.attrib.get("lang", "und") or "und")
+        return
+
+    if not fetcher.audio_fifos:
+        ap.error("at least one --audio-fifo is required for streaming "
+                 "(--video-fifo too, except for audio-only/radio streams)")
+    try:
+        fetcher.run()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()

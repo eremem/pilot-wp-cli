@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# pilot-wp-sessions — list and remove Pilot WP account login sessions.
+#
+#   pilot-wp-sessions [list] [--json]      list active sessions (★ marks ours)
+#   pilot-wp-sessions remove <N> [-f]      remove session #N from the list (not ours)
+#   pilot-wp-sessions remove --others [-f] remove every session except ours
+#
+# "Ours" is the session flagged is_current by the API — the one this cookie jar
+# authenticates as. It is never removable (deleting it would invalidate the jar).
+#
+# Sessions are addressed by the list number, not by session_id: the API returns a
+# fresh session_id on every fetch, so a copied id is stale immediately. `remove <N>`
+# re-fetches and acts on the current #N (sorted by creation time, so numbering is
+# stable while the set is unchanged); it prints what it resolved and asks first.
+# -f/--force/-y skips the prompt (required when run non-interactively).
+#
+# Data sources (nothing hardcoded that an endpoint provides):
+#   GET    /api/v1/user/sessions
+#   DELETE /api/v1/user/sessions
+#
+# Auth is the shared cookie-jar-first cascade (resolve_auth). Unofficial port of
+# plugin.video.pilot.wp; Pilot WP is operated by wp.pl.
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage:
+  pilot-wp-sessions [list] [--json]          list sessions (★ = this session)
+  pilot-wp-sessions remove <N> [--force]     remove session #N (never ours)
+  pilot-wp-sessions remove --others [--force]   remove all sessions except ours
+EOF
+}
+
+# --- parse args ---------------------------------------------------------------
+cmd="list"; json=0; force=0; target=""
+args=("$@")
+[[ ${#args[@]} -gt 0 && "${args[0]}" != -* ]] && { cmd="${args[0]}"; args=("${args[@]:1}"); }
+for a in "${args[@]:-}"; do
+    case "$a" in
+        --json)        json=1 ;;
+        -f|--force|-y) force=1 ;;
+        --others)      target="--others" ;;
+        -h|--help)     usage; exit 0 ;;
+        "")            ;;
+        -*)            echo "pilot-wp-sessions: unknown option: $a" >&2; usage; exit 64 ;;
+        *)             target="$a" ;;
+    esac
+done
+case "$cmd" in
+    list|remove) ;;
+    -h|--help)   usage; exit 0 ;;
+    *)           echo "pilot-wp-sessions: unknown command: $cmd" >&2; usage; exit 64 ;;
+esac
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+resolve_auth
+
+# --- fetch sessions, sorted oldest-first for stable numbering ------------------
+resp=$(call_api GET "$USER_SESSIONS_URL") || { echo "pilot-wp-sessions: API request failed" >&2; exit 4; }
+jq -e '.data | type == "array"' <<<"$resp" >/dev/null 2>&1 \
+    || { echo "pilot-wp-sessions: unexpected response (not authorized?)" >&2; exit 4; }
+sorted=$(jq -c '.data | sort_by(.created_at)' <<<"$resp")
+count=$(jq 'length' <<<"$sorted")
+
+hum() { local d=$1; [[ -n "$d" ]] && printf '%s %s' "${d:0:10}" "${d:11:5}" || printf '—'; }
+
+# --- list ---------------------------------------------------------------------
+if [[ "$cmd" == list ]]; then
+    if [[ "$json" == 1 ]]; then jq '.data' <<<"$resp"; exit 0; fi
+    echo "Active Pilot WP sessions ($count):"
+    echo
+    have_current=0
+    while IFS=$'\t' read -r idx cur device info created updated; do
+        info=${info%$'\r'}
+        mark="  "; suffix=""
+        [[ "$cur" == true ]] && { mark="★ "; suffix="   (this session)"; have_current=1; }
+        printf '%s[%s] %-10s  created %-16s  last %-16s  %s%s\n' \
+            "$mark" "$idx" "$device" "$(hum "$created")" "$(hum "$updated")" "$info" "$suffix"
+    done < <(jqr '. | to_entries[] | [
+                (.key + 1), (.value.is_current == true), (.value.device // "?"),
+                (.value.device_info // "?"), (.value.created_at // ""), (.value.updated_at // "")
+              ] | @tsv' <<<"$sorted")
+    echo
+    [[ "$have_current" == 0 ]] && echo "(current session not identified — is_current absent)"
+    echo "Remove:  pilot-wp-sessions remove <N>         (the ★ session can't be removed)"
+    echo "         pilot-wp-sessions remove --others    (remove all but this one)"
+    exit 0
+fi
+
+# --- remove -------------------------------------------------------------------
+[[ -n "$target" ]] || { echo "pilot-wp-sessions: 'remove' needs a session number or --others" >&2; usage; exit 64; }
+
+confirm() {  # 0 = proceed; honours --force and refuses non-interactive
+    local prompt=$1 ans
+    [[ "$force" == 1 ]] && return 0
+    [[ -t 0 ]] || { echo "pilot-wp-sessions: refusing without --force in a non-interactive shell" >&2; return 1; }
+    read -r -p "$prompt [y/N] " ans
+    [[ "$ans" == [yY] || "$ans" == [yY][eE][sS] ]]
+}
+
+have_current=$(jq 'any(.[]; .is_current == true)' <<<"$sorted")
+
+if [[ "$target" == "--others" ]]; then
+    [[ "$have_current" == true ]] || { echo "pilot-wp-sessions: current session not identified; refusing --others" >&2; exit 3; }
+    others=$(jq '[.[] | select(.is_current != true)] | length' <<<"$sorted")
+    [[ "$others" -eq 0 ]] && { echo "No other sessions to remove." >&2; exit 0; }
+    echo "About to remove $others session(s) — all except this one:" >&2
+    jqr '. | to_entries[] | select(.value.is_current != true)
+         | "  [\(.key + 1)] \(.value.device) — \(.value.device_info // "?") (created \(.value.created_at[0:16]))"' <<<"$sorted" >&2
+    confirm "Remove $others other session(s)?" || { echo "Aborted." >&2; exit 0; }
+    body=$(jq -c '{sessions: [.[] | select(.is_current != true) | {session_id}]}' <<<"$sorted")
+else
+    [[ "$target" =~ ^[1-9][0-9]*$ ]] || { echo "pilot-wp-sessions: expected a session number (see 'list') or --others, got '$target'" >&2; exit 64; }
+    sel=$(jq -c --argjson i "$target" '.[$i-1] // empty' <<<"$sorted")
+    [[ -n "$sel" ]] || { echo "pilot-wp-sessions: no session #$target (there are $count; see 'list')" >&2; exit 4; }
+    if [[ "$(jq '.is_current == true' <<<"$sel")" == true ]]; then
+        echo "pilot-wp-sessions: refusing to remove session #$target — it's the current (★) session;" >&2
+        echo "  removing it would invalidate your cookies." >&2
+        exit 3
+    fi
+    [[ "$have_current" == true || "$force" == 1 ]] \
+        || { echo "pilot-wp-sessions: current session not identified; re-run with --force to remove #$target anyway" >&2; exit 3; }
+    sid=$(jq -r '.session_id' <<<"$sel")
+    info=$(jq -r '.device_info // "?"' <<<"$sel")
+    dev=$(jq -r '.device // "?"' <<<"$sel")
+    created=$(jq -r '.created_at // ""' <<<"$sel")
+    confirm "Remove session #$target — $dev, $info (created $(hum "$created"))?" \
+        || { echo "Aborted." >&2; exit 0; }
+    body=$(jq -n --arg s "$sid" '{sessions: [{session_id: $s}]}')
+fi
+
+# --- perform the DELETE -------------------------------------------------------
+dresp=$(call_api DELETE "$USER_SESSIONS_URL" "$body") \
+    || { echo "pilot-wp-sessions: DELETE request failed" >&2; exit 4; }
+if [[ "$(jqr '.data.status // empty' <<<"$dresp")" == "ok" ]]; then
+    echo "Removed."
+    exit 0
+fi
+err=$(jqr '._meta.error.name // empty' <<<"$dresp")
+echo "pilot-wp-sessions: removal failed${err:+ ($err)}" >&2
+exit 4

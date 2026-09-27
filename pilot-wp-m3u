@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# pilot-wp-m3u [--rescan] OUTPUT_PATH
+#   --rescan   re-probe every channel's DRM status this run, ignoring the cache
+# Generates a tvheadend-style M3U where every entry is a pipe:// invocation
+# of pilot-wp-stream. The stream URL is resolved per tune by pilot-wp-stream,
+# so this M3U holds only channel metadata and never goes stale on token expiry.
+set -euo pipefail
+
+usage="usage: pilot-wp-m3u [--rescan] OUTPUT_PATH"
+RESCAN=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --rescan)  RESCAN=1; shift ;;
+        -h|--help) echo "$usage"; exit 0 ;;
+        -*)        echo "pilot-wp-m3u: unknown option: $1 ($usage)" >&2; exit 2 ;;
+        *)         break ;;
+    esac
+done
+[[ $# -ge 1 ]] || { echo "$usage" >&2; exit 2; }
+OUT=$1
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+resolve_auth
+
+channels_json=$(call_api GET "$CHANNELS_URL")
+jq -e '.data | type == "array"' <<<"$channels_json" >/dev/null \
+    || { echo "channels/list returned non-array; check creds" >&2; exit 4; }
+
+# Prefer the invoked (logical) dir so a symlinked suite dir stays in the M3U
+# and switching the symlink switches versions; fall back to the resolved dir
+# when only this script is symlinked (e.g. into $PATH).
+_invoked_dir=$(cd -- "$(dirname -- "$0")" && pwd)
+if [[ -x "$_invoked_dir/pilot-wp-stream" ]]; then
+    STREAM_BIN="$_invoked_dir/pilot-wp-stream"
+else
+    STREAM_BIN="$_self_dir/pilot-wp-stream"
+fi
+
+# --- DRM tag (cached incremental probe) --------------------------------------
+# The channels/list API exposes no DRM flag, so the only source of a channel's
+# DRM status is opening its stream (fetch_channel → status "drm") — one
+# open+release per channel, and a channel whose slot is busy at probe time
+# returns "limit" and can't be read. DRM status is stable, so it is cached and
+# probed incrementally:
+#   - cache file (PILOT_WP_M3U_CACHE): "id <TAB> drm(0|1) <TAB> probed_epoch".
+#   - a channel is (re)probed only if unknown or older than
+#     PILOT_WP_M3U_CACHE_TTL_DAYS (default 7, capped at 7), so a warm cache does
+#     ~0 probes and channels busy on one run are picked up on a later one.
+#   - probe order is descending multiroom_local_limit, so the collision-fragile
+#     limit=1 channels (the kind you might be watching) are probed last.
+#   - entries for channels that disappeared or went unsubscribed are pruned.
+#   - a failed re-probe keeps the old cached value and retries next build.
+#     Probing never evicts a viewer (v3 refuses at the limit), so a scan during
+#     viewing is safe.
+# PILOT_WP_M3U_DRM_SCAN=0 disables the feature entirely (no probing, no cache,
+# no DRM tag). --rescan forces a full re-probe. The tag is
+# positive-only; there is no non-DRM tag.
+declare -A DRM_IDS=()        # subscribed ids known DRM (read by the loop); empty ⇒ no DRM tag
+if [[ "${PILOT_WP_M3U_DRM_SCAN:-1}" != 1 ]]; then
+    echo "DRM tag: scan disabled (PILOT_WP_M3U_DRM_SCAN=0) — no DRM tag emitted." >&2
+else
+    : "${PILOT_WP_M3U_CACHE:=$PILOT_WP_HOME/.m3u-drm-cache.tsv}"
+    _ttl_days=${PILOT_WP_M3U_CACHE_TTL_DAYS:-7}
+    [[ "$_ttl_days" =~ ^[0-9]+$ ]] || _ttl_days=7
+    (( _ttl_days > 7 )) && _ttl_days=7          # honour the 7-day cap
+    _ttl=$(( _ttl_days * 86400 ))
+    _now=$(date +%s)
+    declare -A _cache_drm=()     # id -> 0|1
+    declare -A _cache_ts=()      # id -> epoch of last successful probe
+
+    # Load the existing cache (tolerate CRLF + malformed lines).
+    if [[ -f "$PILOT_WP_M3U_CACHE" ]]; then
+        while IFS=$'\t' read -r _cid _cdrm _cts _rest; do
+            _cts=${_cts%$'\r'}
+            [[ "$_cid" =~ ^[0-9]+$ && "$_cdrm" =~ ^[01]$ && "$_cts" =~ ^[0-9]+$ ]] || continue
+            _cache_drm[$_cid]=$_cdrm
+            _cache_ts[$_cid]=$_cts
+        done < "$PILOT_WP_M3U_CACHE"
+    fi
+
+    # Current subscribed channels + per-channel concurrency limit (same predicate
+    # as the M3U body so the two never drift).
+    declare -A _sub=()
+    while IFS=$'\t' read -r _cid _lim; do
+        _lim=${_lim%$'\r'}; [[ "$_lim" =~ ^[0-9]+$ ]] || _lim=1
+        [[ "$_cid" =~ ^[0-9]+$ ]] && _sub[$_cid]=$_lim
+    done < <(jq -r '.data[] | select(.access_status != "unsubscribed")
+                    | "\(.id)\t\(.multiroom_local_limit // 1)"' <<<"$channels_json")
+
+    # Subscribed channels needing a (re)probe: unknown, expired, or forced;
+    # ordered by DESCENDING local_limit (fragile limit=1 channels last).
+    mapfile -t _probe_ids < <(
+        for _cid in "${!_sub[@]}"; do
+            if [[ "$RESCAN" == 1 || -z "${_cache_ts[$_cid]:-}" ]] \
+               || (( _now - ${_cache_ts[$_cid]:-0} > _ttl )); then
+                printf '%s\t%s\n' "${_sub[$_cid]}" "$_cid"
+            fi
+        done | sort -rn -k1,1 | cut -f2
+    )
+    _total=${#_probe_ids[@]}
+    if (( _total > 0 )); then
+        echo "DRM scan: probing $_total channel(s) (cache=$PILOT_WP_M3U_CACHE ttl=${_ttl_days}d; PILOT_WP_M3U_DRM_SCAN=0 to skip)..." >&2
+    else
+        echo "DRM scan: cache warm — nothing to probe." >&2
+    fi
+    _n=0 _nok=0 _nfail=0
+    for _cid in "${_probe_ids[@]}"; do
+        _n=$((_n + 1))
+        mapfile -t _R < <(fetch_channel "$_cid")
+        _st=${_R[0]:-error}; _tok=${_R[4]:-}
+        [[ -n "$_tok" ]] && release_stream "$_cid" "$_tok" >/dev/null 2>&1 || true
+        case "$_st" in
+            drm) _cache_drm[$_cid]=1; _cache_ts[$_cid]=$_now; _nok=$((_nok + 1)) ;;
+            ok)  _cache_drm[$_cid]=0; _cache_ts[$_cid]=$_now; _nok=$((_nok + 1)) ;;
+            *)   _nfail=$((_nfail + 1)) ;;   # limit/error: keep prior value, retry next build
+        esac
+        (( _n % 20 == 0 )) && echo "  …$_n/$_total probed" >&2
+    done
+    (( _total > 0 )) && echo "DRM scan: $_nok probed, $_nfail unprobed (busy/error — retried next build)." >&2
+
+    # Persist the cache atomically, subscribed ids only (prunes the rest). A
+    # write failure is non-fatal (this build still tags).
+    mkdir -p "$(dirname "$PILOT_WP_M3U_CACHE")" 2>/dev/null || true
+    _ctmp=$(mktemp 2>/dev/null) || _ctmp=""
+    if [[ -n "$_ctmp" ]]; then
+        for _cid in "${!_sub[@]}"; do
+            [[ -n "${_cache_drm[$_cid]:-}" ]] || continue
+            printf '%s\t%s\t%s\n' "$_cid" "${_cache_drm[$_cid]}" "${_cache_ts[$_cid]:-0}"
+        done > "$_ctmp"
+        if mv -f "$_ctmp" "$PILOT_WP_M3U_CACHE" 2>/dev/null; then
+            chmod 600 "$PILOT_WP_M3U_CACHE" 2>/dev/null || true
+        else
+            rm -f "$_ctmp" 2>/dev/null || true
+            echo "DRM scan: warning: could not write cache $PILOT_WP_M3U_CACHE" >&2
+        fi
+    fi
+
+    # Build the DRM tag set from the (updated) cache, restricted to subscribed.
+    _ndrm=0 _nunknown=0
+    for _cid in "${!_sub[@]}"; do
+        if [[ -z "${_cache_drm[$_cid]:-}" ]]; then
+            _nunknown=$((_nunknown + 1))
+        elif [[ "${_cache_drm[$_cid]}" == 1 ]]; then
+            DRM_IDS[$_cid]=1; _ndrm=$((_ndrm + 1))
+        fi
+    done
+    echo "DRM tag: $_ndrm DRM channel(s) tagged; $_nunknown of ${#_sub[@]} still unknown." >&2
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+printf '#EXTM3U\n' > "$tmp"
+
+# Extract every field we need in one jq pass (v3 channels/list schema).
+#
+# Per channel we emit one TSV row:
+#   id, name, slug, position, icon_dark, thumbnail,
+#   quality (HD/SD), audio_flag (1/0), primary_category, all_categories_csv
+#
+# Notes on the jq pipeline:
+# - category ids are resolved against the API's _meta.categories, so this
+#   script doesn't hardcode the id→Polish-name mapping.
+# - the only filter is access_status != "unsubscribed".
+# - logo = icon.dark (transparent), thumbnail as the fallback; v3 has no
+#   per-channel country, so no tvg-country is emitted.
+# - quality is the v3 "HD"/"SD" string. is_audio_only → "1"/"0" flag: radio="true"
+#   + a Radio tvh-tag here, and the AUDIO_ONLY arg of pilot-wp-stream.
+# - primary_category = _meta.categories[categories[0]] (group-title), default Inne.
+# - all_categories = comma-joined _meta.categories[c] for every c (tvh-tags);
+#   the primary stays in the list so each category surfaces as a tvh tag.
+# Fields carry fallbacks so none is empty: the IFS=$'\t' read below would
+# collapse an empty column (tab is IFS whitespace).
+jq -r '
+    # channels/list returns _meta.categories as an array of {id,name} (the
+    # favourites endpoint uses an {id: name} object); normalise both to an
+    # {idString: name} lookup.
+    (._meta.categories // {}) as $raw
+    | (if ($raw | type) == "array"
+         then (($raw | map({(.id|tostring): .name})) | add // {})
+         else $raw end) as $cats
+    | .data[]
+    | select(.access_status != "unsubscribed")
+    | (.categories // []) as $catids
+    | [
+        (.id | tostring),
+        .name,
+        (.slug // .name),
+        (.position | tostring),
+        (.icon.dark // .thumbnail),
+        (.thumbnail // .icon.dark),
+        (.quality // "SD"),
+        (if .is_audio_only then "1" else "0" end),
+        (($catids[0] // "" | tostring | $cats[.]) // "Inne"),
+        ([$catids[] | tostring | $cats[.] // "Inne"] | join(","))
+      ]
+    | @tsv
+' <<<"$channels_json" |
+while IFS=$'\t' read -r id name slug position icon thumbnail quality audio_flag primary_cat all_cats; do
+    # Strip a CRLF \r (Windows-built jq / CRLF captures) from the last field;
+    # it would otherwise break the tag dedupe ("Radio" vs "Radio\r").
+    all_cats=${all_cats%$'\r'}
+    # tvg-id is an xmltv channel match key (tvheadend stores it as
+    # mm_iptv_epgid and binds xmltv <channel id="..."> against it). The
+    # external xmltv this deployment consumes keys channels by display name,
+    # so name is primary; slug is only used if name is somehow empty.
+    tvg_id="${name:-$slug}"
+    # group-title takes the primary (first) category; tvh-tags below carries
+    # the full list.
+    [[ -z "$primary_cat" ]] && primary_cat="Inne"
+    logo="${icon:-$thumbnail}"
+    # tvheadend's pipe URL parser handles single-quoted args; literal ' in
+    # the name / thumbnail is escaped POSIX-style as '\''.
+    quoted_name=${name//\'/\'\\\'\'}
+    # thumbnail is passed to pilot-wp-stream as the slate logo (DRM / slot-limit
+    # screens). The stream endpoint carries no logo, so it comes from here.
+    slate_logo="${thumbnail:-$icon}"
+    quoted_logo=${slate_logo//\'/\'\\\'\'}
+
+    # tvh-tags is multi-value: HD/SD for video channels or Radio for audio-only,
+    # plus every category name. Overlap with group-title is intentional; dedupe
+    # avoids e.g. "Radio|Radio" (radio channels' category also resolves to Radio).
+    if [[ "$audio_flag" == "1" ]]; then
+        tags=("Radio")
+    else
+        tags=("$quality")
+    fi
+    if [[ -n "$all_cats" ]]; then
+        IFS=',' read -ra cat_arr <<<"$all_cats"
+        tags+=("${cat_arr[@]}")
+    fi
+    # DRM tag from the scan above. This while-loop is a pipe subshell; it
+    # inherits a copy of DRM_IDS, so the read works.
+    [[ -n "${DRM_IDS[$id]:-}" ]] && tags+=("DRM")
+    declare -A seen=()
+    deduped=()
+    for t in "${tags[@]}"; do
+        [[ -z "$t" || -n "${seen[$t]:-}" ]] && continue
+        seen[$t]=1
+        deduped+=("$t")
+    done
+    # Joined with '|': tvheadend's iptv_auto.c splits tvh-tags only on the
+    # pipe character (each '|' becomes a newline = one tag). A comma here
+    # would import the whole string as a single concatenated tag.
+    tags_joined=$(IFS='|'; printf '%s' "${deduped[*]}")
+    unset seen deduped
+
+    radio_attr=""
+    [[ "$audio_flag" == "1" ]] && radio_attr=' radio="true"'
+
+    # tvh-epg="0" disables EIT scanning on this mux (otherwise tvheadend
+    # would periodically invoke pilot-wp-stream just to feed the EPG grabber,
+    # burning a Pilot WP session slot per attempt).
+    # tvh-bouquet groups all channels under the provider name (frees
+    # group-title to carry the real category).
+    # tvg-chno carries the Pilot WP UI ordering as the LCN. tvheadend's
+    # iptv_auto.c looks up channel numbers as tvh-chnum -> tvg-chno ->
+    # channel-number (first non-null wins), so the standard tvg-chno alone pins
+    # the LCN while staying usable by non-tvh consumers. Drop it to let
+    # tvheadend manage its own LCNs.
+    printf '#EXTINF:-1 tvg-id="%s" tvg-chno="%s" tvg-logo="%s" tvg-name="%s" tvh-epg="0" tvh-bouquet="Pilot WP" tvh-tags="%s" group-title="%s"%s,%s\n' \
+        "$tvg_id" "$position" "$logo" "$name" "$tags_joined" "$primary_cat" "$radio_attr" "$name" >> "$tmp"
+    # Pipe URL carries id, single-quoted name (→ SDT service_name), the
+    # thumbnail URL (→ slate logo) and the audio-only flag (1/0). tvheadend
+    # ignores radio="true" above; it is this flag, stamped into the SDT by
+    # pilot-wp-stream, that makes radio channels show up as radio.
+    printf "pipe://%s %s '%s' '%s' %s\n" "$STREAM_BIN" "$id" "$quoted_name" "$quoted_logo" "$audio_flag" >> "$tmp"
+done
+
+mkdir -p "$(dirname "$OUT")"
+mv "$tmp" "$OUT"
+trap - EXIT
+echo "Wrote $OUT" >&2

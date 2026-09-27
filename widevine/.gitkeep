@@ -1,0 +1,2 @@
+# Drop your own legally-provisioned Widevine L3 device file (*.wvd) here.
+# The .wvd itself is git-ignored and must never be committed. See DISCLAIMER.md.

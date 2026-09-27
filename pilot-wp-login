@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# pilot-wp-login [--web [--port N] [--timeout MIN] [--bind ADDR]]
+#
+# Log the suite in to Pilot WP by handing it a logged-in browser session.
+#
+#   (no options)  terminal: empties the cookie jar and forces a fresh login via
+#                 resolve_auth — paste a browser "Copy as cURL" (or type the two
+#                 session cookies).
+#   --web         serves a temporary login page on the local network (default
+#                 port 8199) and prints its address and a one-time code. The user
+#                 pastes the "Copy as cURL" there from any PC; the session is
+#                 checked against the API before it replaces the jar, so a bad
+#                 submission never logs the box out. Stops after a successful
+#                 login, 5 wrong codes, or --timeout minutes (default 15).
+#
+# Run it as the user that runs the streams (for tvheadend on xbian:
+# sudo -u xbian ./pilot-wp-login --web) so that user can read the jar.
+set -euo pipefail
+
+usage="usage: pilot-wp-login [--web [--port N] [--timeout MIN] [--bind ADDR]]"
+web=0 port=8199 timeout=15 bind=0.0.0.0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --web)     web=1; shift ;;
+        --port)    port=${2:?$usage}; shift 2 ;;
+        --timeout) timeout=${2:?$usage}; shift 2 ;;
+        --bind)    bind=${2:?$usage}; shift 2 ;;
+        -h|--help) echo "$usage"; exit 0 ;;
+        *)         echo "pilot-wp-login: unknown argument: $1 ($usage)" >&2; exit 2 ;;
+    esac
+done
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+if (( web )); then
+    if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
+        echo "pilot-wp-login: running as root — the jar will be root-owned and unreadable by the user" >&2
+        echo "                that runs the streams (e.g. tvheadend's). Prefer: sudo -u <that user> $0 --web" >&2
+    fi
+    command -v "$PILOT_WP_PYTHON" >/dev/null 2>&1 \
+        || { echo "pilot-wp-login --web needs python3 ($PILOT_WP_PYTHON not found)" >&2; exit 2; }
+    "$PILOT_WP_PYTHON" "$_self_dir/pilot-wp-weblogin" --lib "$_self_dir" \
+        --port "$port" --timeout "$timeout" --bind "$bind"
+    echo "Logged in. Cookies saved to $PILOT_WP_COOKIES" >&2
+    exit 0
+fi
+
+mkdir -p "$(dirname "$PILOT_WP_COOKIES")"
+: > "$PILOT_WP_COOKIES"
+chmod 600 "$PILOT_WP_COOKIES"
+
+resolve_auth
+
+echo "Logged in. Cookies saved to $PILOT_WP_COOKIES" >&2

@@ -1,0 +1,33 @@
+# Local runtime state, secrets and dev-only tooling — never committed
+config.env
+cookies.txt
+cookies*.txt
+channels.m3u
+pilot-wp.log
+.lock
+verify/
+.drmvenv/
+widevine/*
+!widevine/.gitkeep
+*.wvd
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Generated caches / logs
+.m3u-drm-cache.tsv
+__pycache__/
+*.pyc
+*.log
+
+# Widevine CDM components — never commit key material
+client_id*.bin
+private_key*.pem
+device_client_id_blob
+*.der

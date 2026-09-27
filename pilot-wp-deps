@@ -1,0 +1,394 @@
+#!/usr/bin/env bash
+# pilot-wp-deps — idempotent dependency checker + installer for the pilot-wp-cli suite.
+#
+# Reports the install status of every dependency the suite needs (FTA core + the optional
+# DRM stack) and, on request, installs the missing ones with a single password prompt:
+# `sudo -v` caches the credential up front, then all apt packages go in one
+# `sudo apt-get install`. It also checks that the suite's scripts are executable
+# (tvheadend runs pilot-wp-stream directly); `install` restores the bit.
+#
+# python3 is core: free-to-air plays DASH through pilot-wp-dashlive (stdlib only);
+# without it FTA falls back to HLS.
+#
+#   ./pilot-wp-deps             # (= check) coloured status report, no changes, no sudo
+#   ./pilot-wp-deps check       # same as above
+#   ./pilot-wp-deps install     # install everything missing (one sudo prompt)
+#
+# Flags:
+#   --no-drm        only the FTA core group (skip venv/pywidevine/.wvd)
+#   --require-drm   in `check`, let DRM misses fail the exit code too
+#   --color         force ANSI colour even when stdout is not a TTY
+#   --no-color      never emit ANSI colour (also honours NO_COLOR=…)
+#   -h, --help      this help
+#
+# apt-only by design (Debian/xbian target). On a non-apt host it reports status and
+# prints manual install hints, but never tries to install.
+set -uo pipefail
+
+# --- self-locate (works via symlink / from any cwd), mirrors the other tools -------
+SELF=$(readlink -f -- "$0" 2>/dev/null || echo "$0")
+HERE=$(cd -- "$(dirname -- "$SELF")" && pwd)
+SELF="$HERE/$(basename -- "$SELF")"   # absolute: the cd below breaks a relative $0
+cd "$HERE"
+
+# --- argument parsing --------------------------------------------------------------
+MODE=check
+WANT_DRM=1
+REQUIRE_DRM=0
+COLOR_MODE=auto   # auto|always|never
+for arg in "$@"; do
+  case "$arg" in
+    check|install)   MODE=$arg ;;
+    --no-drm)        WANT_DRM=0 ;;
+    --require-drm)   REQUIRE_DRM=1 ;;
+    --color)         COLOR_MODE=always ;;
+    --no-color)      COLOR_MODE=never ;;
+    -h|--help)
+      # help = the leading comment block, minus the '# '
+      awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$SELF"
+      exit 0 ;;
+    *)
+      printf 'pilot-wp-deps: unknown argument: %s (try --help)\n' "$arg" >&2
+      exit 2 ;;
+  esac
+done
+
+# --- colour palette (one place; auto-disabled off-TTY / NO_COLOR / --no-color) -----
+use_color() {
+  case "$COLOR_MODE" in
+    always) return 0 ;;
+    never)  return 1 ;;
+    *)      [[ -t 1 && -z "${NO_COLOR:-}" ]] ;;
+  esac
+}
+if use_color; then
+  C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_WARN=$'\033[33m'
+  C_HDR=$'\033[1;36m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
+else
+  C_OK=''; C_BAD=''; C_WARN=''; C_HDR=''; C_BOLD=''; C_DIM=''; C_RST=''
+fi
+
+# --- accumulators ------------------------------------------------------------------
+declare -A APT_WANT=()          # apt pkg name -> 1  (deduped set of packages to install)
+declare -a NEED_VENV=()         # non-apt follow-up actions to run on `install`
+declare -a NEED_CHMOD=()        # suite scripts missing the execute bit
+CORE_OK=0; CORE_TOTAL=0
+DRM_OK=0;  DRM_TOTAL=0
+
+# status TAG NAME [DETAIL] [GROUP]
+#   TAG in: OK | MISS | WARN | TODO | FAIL  — drives colour + the pass/fail tallies.
+#   GROUP in: core | drm (default core) — counts toward the right summary.
+status() {
+  local tag=$1 name=$2 detail=${3:-} group=${4:-core} col pad
+  case "$tag" in
+    OK)        col=$C_OK ;;
+    MISS|FAIL) col=$C_BAD ;;
+    WARN|TODO) col=$C_WARN ;;
+    *)         col='' ;;
+  esac
+  printf -v pad '%-4s' "$tag"
+  if [[ -n $detail ]]; then
+    printf '  %s%s%s  %-26s %s%s%s\n' "$col" "$pad" "$C_RST" "$name" "$C_DIM" "$detail" "$C_RST"
+  else
+    printf '  %s%s%s  %s\n' "$col" "$pad" "$C_RST" "$name"
+  fi
+  # tally: OK and WARN (soft) both count as satisfied
+  local ok=0; [[ $tag == OK || $tag == WARN ]] && ok=1
+  if [[ $group == core ]]; then
+    CORE_TOTAL=$((CORE_TOTAL+1)); CORE_OK=$((CORE_OK+ok))
+  else
+    DRM_TOTAL=$((DRM_TOTAL+1));    DRM_OK=$((DRM_OK+ok))
+  fi
+}
+
+header() { printf '%s%s%s\n' "$C_HDR" "$*" "$C_RST"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --- platform detection ------------------------------------------------------------
+HAS_APT=0
+have apt-get && HAS_APT=1
+IS_ROOT=0
+[[ ${EUID:-$(id -u)} -eq 0 ]] && IS_ROOT=1
+
+# queue an apt package (installed by `install`, or printed as a manual hint without apt)
+want_pkg() { APT_WANT["$1"]=1; }
+
+# ==================================================================================
+# CHECKS
+# ==================================================================================
+printf '%s== pilot-wp-deps : dependencies in %s ==%s\n' "$C_BOLD" "$HERE" "$C_RST"
+if [[ $HAS_APT -eq 0 ]]; then
+  printf '%s(no apt-get here — report only; install lines below are manual hints)%s\n' "$C_DIM" "$C_RST"
+fi
+echo
+
+header "-- CORE (free-to-air) --"
+
+# bash >= 4 — the running interpreter. Can't apt-fix the in-use bash meaningfully.
+if [[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]; then
+  status OK "bash >=4" "${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+else
+  status FAIL "bash >=4" "found ${BASH_VERSINFO[0]:-?}; the scripts need bash 4+ (mapfile/arrays)"
+fi
+
+# single-binary core deps: name | binary | apt package
+core_bins=(
+  "curl|curl|curl"
+  "jq|jq|jq"
+  "ffmpeg|ffmpeg|ffmpeg"
+  "ffprobe|ffprobe|ffmpeg"
+  "flock|flock|util-linux"
+  "awk|awk|gawk"
+  "grep|grep|grep"
+)
+for spec in "${core_bins[@]}"; do
+  IFS='|' read -r nm bin pkg <<<"$spec"
+  if have "$bin"; then
+    # `--version` for curl/jq/etc; ffmpeg/ffprobe only accept `-version`, so fall
+    # back to it. Capture the whole banner first: piping straight into `head` closes
+    # the pipe early and SIGPIPE-kills block-buffered tools before they flush.
+    ver=$({ "$bin" --version || "$bin" -version; } 2>/dev/null)
+    ver=$(printf '%s\n' "$ver" | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)
+    status OK "$nm" "${ver:-present}"
+  else
+    status MISS "$nm" "-> apt: $pkg"
+    want_pkg "$pkg"
+  fi
+done
+
+# coreutils set — one row; missing any => coreutils. (Effectively always present.)
+cu_missing=()
+for b in paste date mktemp mkdir mv rm readlink dirname tr seq sort chmod sleep timeout find; do
+  have "$b" || cu_missing+=("$b")
+done
+if [[ ${#cu_missing[@]} -eq 0 ]]; then
+  status OK "coreutils set" "paste,date,mktemp,timeout,…"
+else
+  status MISS "coreutils set" "missing: ${cu_missing[*]} -> apt: coreutils"
+  want_pkg coreutils
+fi
+
+# python3 — runs pilot-wp-dashlive (FTA DASH, stdlib only; also the base for .drmvenv)
+if have python3; then
+  status OK "python3" "$(python3 -V 2>&1 | awk '{print $2}')"
+else
+  status MISS "python3" "FTA falls back to HLS -> apt: python3"
+  want_pkg python3
+fi
+
+# execute bits — copying or editing the scripts from another OS can drop them, and
+# tvheadend runs pilot-wp-stream directly. The library is only sourced, so it's exempt.
+for f in pilot-wp-* diagnostics/pilot-wp-*; do
+  [[ -f $f && $f != pilot-wp-common.sh ]] || continue
+  [[ $(head -c2 -- "$f" 2>/dev/null) == '#!' ]] || continue
+  [[ -x $f ]] || NEED_CHMOD+=("$f")
+done
+if [[ ${#NEED_CHMOD[@]} -eq 0 ]]; then
+  status OK "scripts executable"
+else
+  status MISS "scripts executable" "not: ${NEED_CHMOD[*]} -> chmod +x"
+fi
+
+# DejaVu TTF — soft: slate renders without text if absent, so WARN not FAIL.
+FONT=${PILOT_WP_SLATE_FONT:-/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf}
+if [[ -f $FONT ]]; then
+  status OK "DejaVuSans.ttf" "$FONT"
+else
+  status WARN "DejaVuSans.ttf" "slate text disabled -> apt: fonts-dejavu-core"
+  want_pkg fonts-dejavu-core
+fi
+
+# ==================================================================================
+if [[ $WANT_DRM -eq 1 ]]; then
+  echo
+  header "-- DRM (optional) --"
+
+  # python3-venv — probed with `python3 -m venv --help`
+  if have python3 && python3 -m venv --help >/dev/null 2>&1; then
+    status OK "python3-venv" "venv module available" drm
+  else
+    status MISS "python3-venv" "-> apt: python3-venv" drm
+    want_pkg python3-venv
+  fi
+
+  # ffmpeg CENC decrypt support (mov demuxer -decryption_key). Not apt-fixable here.
+  if have ffmpeg && ffmpeg -hide_banner -h demuxer=mov 2>/dev/null | grep -qi 'decryption_key'; then
+    status OK "ffmpeg -decryption_key" "$(ffmpeg -hide_banner -version 2>/dev/null | head -1 | awk '{print $3}')" drm
+  else
+    status TODO "ffmpeg -decryption_key" "needs a modern ffmpeg (>=4.x); not apt-fixable here" drm
+  fi
+
+  # .drmvenv with pywidevine AND requests (getkeys imports both)
+  VENV_PY="$HERE/.drmvenv/bin/python"
+  if [[ -x $VENV_PY ]] && "$VENV_PY" -c 'import pywidevine, requests' >/dev/null 2>&1; then
+    pwv=$("$VENV_PY" -c 'import pywidevine;print(pywidevine.__version__)' 2>/dev/null)
+    status OK ".drmvenv/pywidevine" "pywidevine ${pwv:-?} + requests" drm
+  else
+    status MISS ".drmvenv/pywidevine" "will build venv + pip install pywidevine" drm
+    NEED_VENV+=(venv)
+  fi
+
+  # .wvd device file — never auto-installable (user-provisioned secret), report only.
+  shopt -s nullglob
+  wvds=("$HERE"/widevine/*.wvd)
+  shopt -u nullglob
+  if [[ -n ${PILOT_WP_WVD:-} && -r ${PILOT_WP_WVD:-} ]]; then
+    status OK "widevine .wvd" "$PILOT_WP_WVD" drm
+  elif [[ ${#wvds[@]} -ge 1 ]]; then
+    status OK "widevine .wvd" "${#wvds[@]} in widevine/ (default: $(basename "${wvds[0]}"))" drm
+  else
+    status MISS "widevine .wvd" "provision an L3 device file (manual; chmod 600)" drm
+  fi
+fi
+
+# ==================================================================================
+# SUMMARY
+# ==================================================================================
+echo
+core_col=$C_BAD; [[ $CORE_OK -eq $CORE_TOTAL ]] && core_col=$C_OK
+summary="Summary: CORE ${core_col}${CORE_OK}${C_RST}/${CORE_TOTAL}"
+if [[ $WANT_DRM -eq 1 ]]; then
+  drm_col=$C_BAD; [[ $DRM_OK -eq $DRM_TOTAL ]] && drm_col=$C_OK
+  summary+=", DRM ${drm_col}${DRM_OK}${C_RST}/${DRM_TOTAL}"
+fi
+printf '%s\n' "$summary"
+
+# what would change, in install terms
+apt_list=("${!APT_WANT[@]}")
+nothing_to_do=1
+[[ ${#apt_list[@]} -gt 0 || ${#NEED_VENV[@]} -gt 0 || ${#NEED_CHMOD[@]} -gt 0 ]] && nothing_to_do=0
+
+# ==================================================================================
+# CHECK MODE — report only, derive exit code, suggest the install command.
+# ==================================================================================
+if [[ $MODE == check ]]; then
+  if [[ $nothing_to_do -eq 0 ]]; then
+    hint=""
+    [[ ${#apt_list[@]} -gt 0 ]] && hint+=" apt: $(printf '%s ' "${apt_list[@]}")"
+    [[ ${#NEED_VENV[@]} -gt 0 ]] && hint+=" venv: .drmvenv (pywidevine)"
+    [[ ${#NEED_CHMOD[@]} -gt 0 ]] && hint+=" chmod +x: ${#NEED_CHMOD[@]} script(s)"
+    printf '%sFix with:%s ./pilot-wp-deps install%s   (%s)%s\n' "$C_BOLD" "$C_RST" "$C_DIM" "${hint# }" "$C_RST"
+  else
+    printf '%sAll checked dependencies satisfied.%s\n' "$C_OK" "$C_RST"
+  fi
+  # exit non-zero if any CORE dep unsatisfied; DRM only when --require-drm.
+  rc=0
+  [[ $CORE_OK -lt $CORE_TOTAL ]] && rc=1
+  [[ $WANT_DRM -eq 1 && $REQUIRE_DRM -eq 1 && $DRM_OK -lt $DRM_TOTAL ]] && rc=1
+  exit $rc
+fi
+
+# ==================================================================================
+# INSTALL MODE
+# ==================================================================================
+echo
+header "== install =="
+
+if [[ $nothing_to_do -eq 1 ]]; then
+  printf '%sNothing to install — already satisfied.%s\n' "$C_OK" "$C_RST"
+  # note any non-fixable gaps so the user isn't misled by a green no-op
+  if [[ $WANT_DRM -eq 1 ]] && have ffmpeg && ! ffmpeg -hide_banner -h demuxer=mov 2>/dev/null | grep -qi 'decryption_key'; then
+    printf '%s  (DRM still needs a newer ffmpeg with mov -decryption_key)%s\n' "$C_WARN" "$C_RST"
+  fi
+  exit 0
+fi
+
+# --- step 0: execute bits (no sudo; the scripts belong to the invoking user) -------
+if [[ ${#NEED_CHMOD[@]} -gt 0 ]]; then
+  if chmod +x -- "${NEED_CHMOD[@]}"; then
+    printf '%sexecute bit restored: %s%s\n' "$C_OK" "${NEED_CHMOD[*]}" "$C_RST"
+  else
+    printf '%schmod failed — run: chmod +x %s%s\n' "$C_BAD" "${NEED_CHMOD[*]}" "$C_RST"
+    exit 1
+  fi
+fi
+
+# --- step 1: apt packages (single sudo prompt) -------------------------------------
+if [[ ${#apt_list[@]} -gt 0 ]]; then
+  if [[ $HAS_APT -eq 0 ]]; then
+    printf '%sNo apt-get on this host. Install manually:%s\n' "$C_WARN" "$C_RST"
+    printf '    %s\n' "apt-get install ${apt_list[*]}  # or your distro's equivalent"
+  else
+    # Acquire root once, up front: one prompt for the whole run.
+    SUDO=()
+    if [[ $IS_ROOT -eq 0 ]]; then
+      if ! have sudo; then
+        printf '%sNot root and no sudo. Run as root:%s\n' "$C_BAD" "$C_RST"
+        printf '    %s\n' "apt-get update && apt-get install ${apt_list[*]}"
+        exit 1
+      fi
+      SUDO=(sudo)
+      printf '%sRequesting sudo (single prompt for the whole run)…%s\n' "$C_DIM" "$C_RST"
+      if ! sudo -v; then
+        printf '%sCould not acquire sudo.%s\n' "$C_BAD" "$C_RST"
+        exit 1
+      fi
+    fi
+    # -y: the sudo password is the only intended prompt; apt must not ask again mid-run.
+    printf '%s+ apt-get update%s\n' "$C_DIM" "$C_RST"
+    "${SUDO[@]}" apt-get update || printf '%s(apt-get update failed; continuing)%s\n' "$C_WARN" "$C_RST"
+    printf '%s+ apt-get install %s%s\n' "$C_DIM" "${apt_list[*]}" "$C_RST"
+    if "${SUDO[@]}" apt-get install -y "${apt_list[@]}"; then
+      printf '%sapt packages installed.%s\n' "$C_OK" "$C_RST"
+    else
+      printf '%sapt-get install failed — see output above.%s\n' "$C_BAD" "$C_RST"
+      exit 1
+    fi
+  fi
+fi
+
+# --- step 2: DRM venv (.drmvenv) — runs as the invoking user, no sudo --------------
+# Cascade: venv → (--without-pip + get-pip bootstrap) →
+# pip install pywidevine (pulls requests) → import check.
+if [[ ${#NEED_VENV[@]} -gt 0 ]]; then
+  echo
+  printf '%s-- building .drmvenv (pywidevine) --%s\n' "$C_BOLD" "$C_RST"
+  if ! have python3; then
+    printf '%spython3 not available even after apt — cannot build .drmvenv.%s\n' "$C_BAD" "$C_RST"
+    exit 1
+  fi
+  if [[ ! -x .drmvenv/bin/python ]]; then
+    if python3 -m venv .drmvenv 2>/dev/null && [[ -x .drmvenv/bin/python ]]; then
+      printf '  created .drmvenv\n'
+    else
+      printf '  venv-with-pip unavailable; bootstrapping pip via get-pip\n'
+      if python3 -m venv --without-pip .drmvenv 2>/dev/null && [[ -x .drmvenv/bin/python ]]; then
+        if curl -sSL https://bootstrap.pypa.io/get-pip.py -o /tmp/pwp-get-pip.py \
+           && .drmvenv/bin/python /tmp/pwp-get-pip.py >/dev/null 2>&1; then
+          rm -f /tmp/pwp-get-pip.py
+        else
+          printf '%s  FAIL pip bootstrap (network? try: apt install python3-pip)%s\n' "$C_BAD" "$C_RST"
+          exit 1
+        fi
+      else
+        printf '%s  FAIL python3 -m venv (try: apt install python3-venv)%s\n' "$C_BAD" "$C_RST"
+        exit 1
+      fi
+    fi
+  fi
+  if ! .drmvenv/bin/python -c 'import pywidevine, requests' >/dev/null 2>&1; then
+    printf '  installing pywidevine (pulls requests; can take a minute on ARM)…\n'
+    if ! .drmvenv/bin/pip install --quiet --disable-pip-version-check pywidevine; then
+      printf '%s  pip install failed. Fallback (uses the cached sudo):%s\n' "$C_WARN" "$C_RST"
+      printf '    %s\n' "sudo apt-get install python3-pycryptodome python3-lxml"
+      printf '    %s\n' "rm -rf .drmvenv && python3 -m venv --system-site-packages .drmvenv && .drmvenv/bin/pip install pywidevine"
+      exit 1
+    fi
+  fi
+  if .drmvenv/bin/python -c 'import pywidevine, requests, sys; print("  OK   pywidevine "+pywidevine.__version__+" ("+sys.prefix+")")'; then :; else
+    printf '%s  FAIL pywidevine/requests not importable by .drmvenv%s\n' "$C_BAD" "$C_RST"
+    exit 1
+  fi
+fi
+
+echo
+printf '%sDone. Re-run ./pilot-wp-deps to confirm an all-green report.%s\n' "$C_OK" "$C_RST"
+# remind about the parts an installer can't satisfy
+if [[ $WANT_DRM -eq 1 ]]; then
+  shopt -s nullglob; wvds=("$HERE"/widevine/*.wvd); shopt -u nullglob
+  if [[ -z ${PILOT_WP_WVD:-} && ${#wvds[@]} -eq 0 ]]; then
+    printf '%sDRM note: still need an L3 Widevine .wvd dropped into widevine/ (provision it yourself; never commit it).%s\n' "$C_WARN" "$C_RST"
+  fi
+fi
+exit 0

@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# pilot-wp-status — one-shot health check for a pilot-wp-cli install.
+#
+# Answers "is my setup ready to stream?": config, core dependencies, execute
+# bits, authentication (live probe), the free-to-air playback path (DASH or the
+# HLS fallback), and optional DRM readiness. Read-only — it never logs in, edits
+# config, or opens a stream slot.
+#
+#   ./pilot-wp-status            # coloured report (auto-plain when piped)
+#   ./pilot-wp-status --color    # force ANSI colour even when piped
+#   ./pilot-wp-status --no-color # never emit ANSI colour (also honours NO_COLOR)
+#   ./pilot-wp-status -h|--help  # this help
+#
+# Exit code: 0 = ready for free-to-air streaming (deps + valid session); 1 = a
+# blocking problem (missing core dep, or no/expired session); 2 = bad usage.
+# DRM problems never fail the exit code (DRM is optional; FTA still works) — they
+# are reported as warnings. For the full dependency/installer matrix, run
+# `./pilot-wp-deps check`.
+set -uo pipefail
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"   # config.env is auto-sourced by the library
+
+# --- argument parsing ---------------------------------------------------------
+COLOR_MODE=auto   # auto|always|never
+for arg in "$@"; do
+    case "$arg" in
+        --color)    COLOR_MODE=always ;;
+        --no-color) COLOR_MODE=never ;;
+        -h|--help)
+            awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
+            exit 0 ;;
+        *) printf 'pilot-wp-status: unknown argument: %s (try --help)\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+
+# --- colour (auto-off when piped / NO_COLOR / --no-color), mirrors pilot-wp-deps
+use_color() {
+    case "$COLOR_MODE" in
+        always) return 0 ;;
+        never)  return 1 ;;
+        *)      [[ -t 1 && -z "${NO_COLOR:-}" ]] ;;
+    esac
+}
+if use_color; then
+    C_OK=$'\033[32m'; C_BAD=$'\033[31m'; C_WARN=$'\033[33m'; C_HDR=$'\033[1;36m'; C_RST=$'\033[0m'
+else
+    C_OK=''; C_BAD=''; C_WARN=''; C_HDR=''; C_RST=''
+fi
+
+hdr()  { printf '\n%s%s%s\n' "$C_HDR" "$*" "$C_RST"; }
+ok()   { printf '  %s[ ok ]%s %s\n'  "$C_OK"   "$C_RST" "$*"; }
+warn() { printf '  %s[warn]%s %s\n'  "$C_WARN" "$C_RST" "$*"; }
+bad()  { printf '  %s[FAIL]%s %s\n'  "$C_BAD"  "$C_RST" "$*"; }
+
+issues=0   # blocking (FTA) problems
+
+# --- Install ------------------------------------------------------------------
+hdr "Install"
+printf '  %-12s: %s\n' "scripts" "$PILOT_WP_LIB"
+printf '  %-12s: %s\n' "home" "$PILOT_WP_HOME"
+if [[ -f "$PILOT_WP_CONFIG" ]]; then ok "config.env : $PILOT_WP_CONFIG"
+else warn "config.env : not present (built-in defaults in use — optional)"; fi
+
+# --- Dependencies (core) ------------------------------------------------------
+hdr "Dependencies"
+for c in curl jq ffmpeg; do
+    if command -v "$c" >/dev/null 2>&1; then ok "$c"; else bad "$c missing (required)"; issues=1; fi
+done
+for c in ffprobe setsid flock; do
+    command -v "$c" >/dev/null 2>&1 && ok "$c" || warn "$c missing (recommended)"
+done
+# tvheadend runs pilot-wp-stream directly, so a lost execute bit breaks every tune.
+if [[ -x "$PILOT_WP_LIB/pilot-wp-stream" ]]; then ok "pilot-wp-stream is executable"
+else bad "pilot-wp-stream is not executable — run ./pilot-wp-deps install (or chmod +x)"; issues=1; fi
+printf '  %s\n' "full matrix incl. DRM stack: ./pilot-wp-deps check"
+
+# --- Free-to-air playback path (DASH preferred; HLS fallback) -----------------
+hdr "Free-to-air playback"
+if fta_dash_available; then
+    ok "DASH via pilot-wp-dashlive ($PILOT_WP_PYTHON)"
+elif [[ "${PILOT_WP_FTA_DASH:-1}" != 1 ]]; then
+    warn "HLS (PILOT_WP_FTA_DASH=${PILOT_WP_FTA_DASH}) — channels whose HLS audio is mistimed play silent"
+else
+    warn "HLS fallback: no $PILOT_WP_PYTHON — install python3 (./pilot-wp-deps install); some channels play silent on HLS"
+fi
+
+# --- Authentication (live probe) ----------------------------------------------
+hdr "Authentication"
+if [[ -s "$PILOT_WP_COOKIES" ]]; then
+    ok "cookie jar : $PILOT_WP_COOKIES"
+    if cookies_authorize; then
+        ok "session    : valid (API authorized the saved cookies)"
+    else
+        rc=$?
+        if [[ "$rc" == 2 ]]; then
+            warn "session    : could not reach the API (transient? check connectivity)"
+        else
+            bad "session    : rejected/expired — run ./pilot-wp-login --web (or ./pilot-wp-login)"; issues=1
+        fi
+    fi
+else
+    bad "cookie jar : missing/empty — run ./pilot-wp-login --web (or ./pilot-wp-login)"; issues=1
+fi
+
+# --- DRM playback (optional; never fails the exit code) -----------------------
+hdr "DRM playback (optional)"
+if [[ "${PILOT_WP_DRM_ENABLE:-0}" == 1 ]]; then
+    printf '  %-11s: %s\n' "enabled" "yes (PILOT_WP_DRM_ENABLE=1)"
+    if [[ -n "${PILOT_WP_WVD:-}" && -r "${PILOT_WP_WVD:-}" ]]; then ok ".wvd       : $PILOT_WP_WVD"
+    else warn ".wvd       : not found/readable — drop an L3 device file into widevine/"; fi
+    if "$PILOT_WP_PYTHON" -c 'import pywidevine' >/dev/null 2>&1; then ok "pywidevine : importable by $PILOT_WP_PYTHON"
+    else warn "pywidevine : not importable by $PILOT_WP_PYTHON — run ./pilot-wp-deps install"; fi
+    if drm_playback_available; then ok "DRM ready  : yes (protected channels will decrypt)"
+    else warn "DRM ready  : no — protected channels show the slate until the above is fixed"; fi
+else
+    printf '  %-11s: %s\n' "enabled" "no — DRM channels show the slate"
+    printf '  %s\n' "set PILOT_WP_DRM_ENABLE=1 (+ an L3 .wvd) to decrypt them"
+fi
+
+# --- Summary ------------------------------------------------------------------
+hdr "Summary"
+if [[ "$issues" == 0 ]]; then ok "ready for free-to-air streaming"; exit 0
+else bad "the FAIL item(s) above need attention before streaming"; exit 1; fi

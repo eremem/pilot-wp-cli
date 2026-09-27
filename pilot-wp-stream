@@ -1,0 +1,382 @@
+#!/usr/bin/env bash
+# pilot-wp-stream CHANNEL_ID [CHANNEL_NAME] [LOGO_URL] [AUDIO_ONLY]
+#
+# Resolves the current v3 stream for a channel and pipes it as MPEG-TS to
+# stdout. Designed to be invoked by tvheadend via a pipe:// URL (one process
+# per tune; tvheadend tears it down with SIGTERM or a process-group SIGKILL).
+#
+# CHANNEL_NAME → MPEG-TS SDT service_name (pilot-wp-m3u always passes it).
+# LOGO_URL     → channel thumbnail, used as the logo on the DRM / slot-limit
+#                slate (pilot-wp-m3u passes the v3 .thumbnail).
+# AUDIO_ONLY   → "1" for radio channels (see mpegts_svc below).
+#
+# v3 specifics handled here:
+#   - mandatory heartbeat: POST .data.heartbeat.url every .data.heartbeat.interval
+#     seconds while streaming (the session is reaped if heartbeats stop).
+#   - clean close: on teardown a detached releaser frees the slot the web-client
+#     way (release_stream). If even that is skipped, the session self-expires
+#     ~20-40s after heartbeats stop.
+#   - playback: clear (FTA) channels play their DASH through pilot-wp-dashlive
+#     (HLS as the fallback); DRM channels play the same way, decrypted with a
+#     Widevine key, when DRM playback is enabled. DRM without playback and the
+#     multiroom limit emit an informational slate instead of failing
+#     (tvheadend shows a steady picture).
+set -euo pipefail
+
+channel_id="${1:?usage: pilot-wp-stream CHANNEL_ID [CHANNEL_NAME] [LOGO_URL] [AUDIO_ONLY]}"
+channel_name="${2:-}"
+logo_url="${3:-}"
+audio_only="${4:-0}"   # "1" for audio-only (radio) channels; passed by pilot-wp-m3u
+ch_name=""   # channel name from the stream response; set by fetch_channel below
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+# Audio-only channels must declare service_type=digital_radio in the MPEG-TS SDT,
+# otherwise ffmpeg's mpegts muxer defaults to digital_tv and tvheadend classifies
+# the service as TV (HTSP content 0x01), so Kodi shows it as a video channel.
+# With radio, tvheadend's SDT scan records ST_RADIO → content 0x02 → Kodi files it
+# under Radio. tvheadend ignores the M3U radio="true" attribute; the SDT is what it
+# honours. Used by the HLS path below; run_dash_pipeline sets the same flag itself.
+mpegts_svc=""
+[[ "$audio_only" == 1 ]] && mpegts_svc="-mpegts_service_type digital_radio"
+
+retries=${PILOT_WP_RETRIES:-3}
+limit_retries=${PILOT_WP_LIMIT_RETRIES:-3}
+limit_delay=${PILOT_WP_LIMIT_DELAY:-2}
+
+# --- tracing ------------------------------------------------------------------
+# trace MESSAGE — debug line to stderr, only when PILOT_WP_TRACE=1. tvheadend
+# captures the pipe child's stderr into its log (prefixed "spawn:", already
+# timestamped). PID and channel id tell concurrent tunes apart.
+trace() { trace_line "pilot-wp-stream[$$ ch=$channel_id]: $*"; }
+
+# trace_tracks HLS_URL — HLS path only, when tracing: log the video/audio track
+# counts ffmpeg maps (1 video via -map 0:v:0 of N ABR rungs, all audio via
+# -map 0:a) as "video=1/N audio=M/M", the same shape dashlive logs for DASH.
+# Call it backgrounded ("trace_tracks ... &") so the manifest fetch (or the
+# slower ffprobe fallback) never delays the tune. Reads only the CDN manifest (no
+# Pilot WP session) and writes only to stderr, never to the MPEG-TS pipe.
+trace_tracks() {
+    [[ "${PILOT_WP_TRACE:-0}" == 1 ]] || return 0
+    local url=$1 master vid aa nstream
+    # Parse the HLS master playlist (URL-token authed; the cookie is never sent to
+    # the CDN). Pilot WP radio masters carry a single audio-only #EXT-X-STREAM-INF
+    # with no RESOLUTION → reported as "video=0/0 …".
+    master=$(curl -sS -k -L -m 10 -A "$PILOT_WP_UA" "$url" 2>/dev/null)
+    # Not a master playlist (fetch failed / bare media playlist) → ffprobe.
+    [[ "$master" == *"#EXTM3U"* ]] || { trace_tracks_ffprobe "$url"; return; }
+    # Video rungs = #EXT-X-STREAM-INF lines with a RESOLUTION; audio-only variants
+    # (CODECS=mp4a, no RESOLUTION) don't count.
+    # `grep -c` prints the count but exits 1 when it's 0; `|| true` keeps that
+    # clean "0" (a `|| echo 0` would append a second line and break the (( )) below).
+    vid=$(grep '^#EXT-X-STREAM-INF' <<<"$master" | grep -c 'RESOLUTION=') || true
+    aa=$(grep -c '^#EXT-X-MEDIA:TYPE=AUDIO' <<<"$master") || true
+    if (( vid > 0 )); then
+        # Video stream: 1 video sent of <vid> rungs; audio = separate renditions, or
+        # muxed-into-the-variant (count as 1) when none are declared.
+        [[ "$aa" == 0 ]] && grep -qiE 'CODECS="[^"]*(mp4a|ac-3|ec-3|opus)' <<<"$master" && aa=1
+        trace "tracks: video=1/${vid} audio=${aa}/${aa}"
+    else
+        # Audio-only (radio): audio tracks = declared renditions, else the audio-only
+        # #EXT-X-STREAM-INF entries are bitrate rungs of one program → 1.
+        nstream=$(grep -c '^#EXT-X-STREAM-INF' <<<"$master") || true
+        (( aa == 0 && nstream > 0 )) && aa=1
+        if (( aa == 0 )); then trace_tracks_ffprobe "$url"; return; fi
+        trace "tracks: video=0/0 audio=${aa}/${aa}"
+    fi
+}
+
+# Fallback track probe (bare media playlist / unparseable master): ffprobe is
+# heavier (downloads a few seconds) but format-agnostic. Counts only the first
+# program's streams, since counting all of them multi-counts the ABR ladder.
+trace_tracks_ffprobe() {
+    local url=$1 counts
+    counts=$(timeout 20 ffprobe -hide_banner -v error -user_agent "$PILOT_WP_UA" \
+        -probesize 15M -analyzeduration 6000000 -show_programs -of json "$url" 2>/dev/null \
+        | jq -r '.programs[0].streams as $s
+                 | "video=\([$s[]|select(.codec_type=="video")]|length) audio=\([$s[]|select(.codec_type=="audio")]|length)"' 2>/dev/null) || counts=""
+    [[ -n "$counts" ]] && trace "tracks: $counts" || trace "tracks: (probe failed)"
+}
+
+trace "start: name='${channel_name}' parent_pid=$PPID retries=$retries"
+
+# --- teardown -----------------------------------------------------------------
+# cleanup runs on a catchable teardown (normal exit, SIGTERM/INT/HUP, or the
+# stdout pipe closing) and only stops the heartbeat and ffmpeg children so they
+# don't orphan. It does not release the Pilot WP slot: that is owned solely by
+# the detached releaser (spawn_releaser), which also covers the uncatchable case —
+# tvheadend reaps the pipe child by SIGKILLing its whole process group (this
+# script + heartbeat + ffmpeg at once), where no trap can run. A single release
+# owner also avoids a double close.
+hb_pid=""
+ff_pid=""
+teardown_sig=""
+cleanup() {
+    trap - EXIT INT TERM HUP PIPE
+    trace "teardown (${teardown_sig:-exit}): hb_pid=${hb_pid:-none} ff_pid=${ff_pid:-none} (release handled by detached releaser)"
+    [[ -n "$hb_pid" ]] && kill "$hb_pid" 2>/dev/null || true
+    [[ -n "$ff_pid" ]] && kill "$ff_pid" 2>/dev/null || true
+    [[ -n "$ff_pid" ]] && wait "$ff_pid" 2>/dev/null || true
+    # Remove this tune's dashlive FIFOs, if any (video + every audio a0, a1, …).
+    # The fetcher writing them exits on the broken pipe once ffmpeg is gone.
+    rm -f "${TMPDIR:-/tmp}/pilot-wp-drm-$$-"*.fifo "/dev/shm/pilot-wp-drm-$$-"*.fifo 2>/dev/null || true
+    trace "cleanup complete"
+}
+# Record the triggering signal for the trace. A SIGKILL leaves no teardown line.
+trap 'teardown_sig=TERM; cleanup' TERM
+trap 'teardown_sig=INT;  cleanup' INT
+trap 'teardown_sig=HUP;  cleanup' HUP
+trap 'teardown_sig=PIPE; cleanup' PIPE
+trap cleanup EXIT
+
+# --- spawn_releaser MAIN_PID CHANNEL_ID TOKEN ---------------------------------
+# The slot-release owner. Launched once at tune start into its own session via
+# setsid, so tvheadend's process-group SIGKILL does not reach it. It polls
+# MAIN_PID and, once the main pilot-wp-stream dies by any means, calls
+# release_stream. All state is passed as args/env (no runtime files); stdio goes
+# to /dev/null so it never holds the MPEG-TS pipe open (which would stop
+# tvheadend from seeing the stream end). No-op without a token or without setsid
+# (the slot then self-expires).
+#
+# The releaser outlives tvheadend's stderr pipe, so its trace can't reach the
+# tvheadend log; if PILOT_WP_RELEASE_LOG names a file, it appends its actions
+# there instead. Unset (default) → no file is touched.
+spawn_releaser() {
+    local main=$1 ch=$2 tok=$3
+    [[ -z "$tok" ]] && return 0
+    if ! command -v setsid >/dev/null 2>&1; then
+        trace "setsid not found — on-teardown slot release disabled (relying on ~20-40s self-expiry)"
+        return 0
+    fi
+    [[ -n "${PILOT_WP_RELEASE_LOG:-}" ]] && trace "slot release detached (setsid); logging to $PILOT_WP_RELEASE_LOG"
+    PILOT_WP_HOME="$PILOT_WP_HOME" PILOT_WP_COOKIES="$PILOT_WP_COOKIES" DEVICE_TYPE="$DEVICE_TYPE" \
+    PILOT_WP_RELEASE_LOG="${PILOT_WP_RELEASE_LOG:-}" \
+    setsid bash -c '
+        lib=$1; main=$2; ch=$3; tok=$4
+        log=${PILOT_WP_RELEASE_LOG:-}
+        rlog() { [[ -n "$log" ]] || return 0; printf "%(%F %T)T pilot-wp-release[%d ch=%s] %s\n" -1 "$$" "$ch" "$*" >>"$log" 2>/dev/null || true; }
+        source "$lib/pilot-wp-common.sh" 2>/dev/null || { rlog "ERROR: could not source lib; slot NOT released"; exit 0; }
+        rlog "watching main pid=$main (token ${tok:0:8}...)"
+        while kill -0 "$main" 2>/dev/null; do sleep 1; done
+        rlog "main gone; releasing slot"
+        # Reap the dashlive FIFOs of this tune: a SIGKILL skips cleanup(), but this
+        # releaser survives the group kill. No-op if cleanup() already removed them.
+        rm -f "${TMPDIR:-/tmp}/pilot-wp-drm-${main}-"*.fifo "/dev/shm/pilot-wp-drm-${main}-"*.fifo 2>/dev/null || true
+        if release_stream "$ch" "$tok" >/dev/null 2>&1; then
+            rlog "release: ok"
+        else
+            rlog "release: FAILED (slot self-expires ~20-40s)"
+        fi
+    ' _ "$PILOT_WP_LIB" "$main" "$ch" "$tok" </dev/null >/dev/null 2>&1 &
+}
+
+# --- heartbeat loop -----------------------------------------------------------
+# POST the heartbeat URL every interval seconds (heartbeat_once reads the jar
+# but never writes it back, so concurrent tunes don't churn cookies.txt).
+heartbeat_loop() {
+    local url=$1 interval=$2 code
+    [[ -z "$url" ]] && return 0
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=20
+    while :; do
+        sleep "$interval"
+        code=$(heartbeat_once "$url")
+        trace "heartbeat -> HTTP $code"
+    done
+}
+
+slate() {  # slate MESSAGE — emit slate to stdout (blocks until pipe closes).
+    # The channel name is passed as the title; emit_slate shows it only when the
+    # logo can't be rendered. MESSAGE may contain \n (expanded here via %b).
+    # shellcheck disable=SC2059
+    emit_slate "$(printf '%b' "$1")" "$logo_url" "${channel_name:-$ch_name}"
+}
+
+# stream_dash KEY — restream dash_url through the in-order pilot-wp-dashlive →
+# ffmpeg pipeline with the heartbeat + detached releaser; never returns (exits with
+# ffmpeg's status). KEY is the Widevine content key, or empty for a clear channel.
+stream_dash() {
+    local key=$1 kind drm_ctrl=""
+    [[ -n "$key" ]] && kind=drm || kind=fta
+    spawn_releaser "$$" "$channel_id" "$token"
+    # Token-gated (videostar) channels revoke segment access ~3 min into
+    # continuous play. session_refresh_loop heartbeats and re-issues the
+    # session (switch_session) before it dies, pushing fresh URLs to dashlive
+    # via a /dev/shm control FIFO (RAM, no SD wear); the content KID is stable,
+    # so the key is reused and dashlive swaps the URL in place without a glitch.
+    # Token-less (redcdn) channels never expire and get the plain heartbeat.
+    if is_token_gated "$dash_url"; then
+        drm_ctrl=$(drm_control_fifo_path "$$")
+        rm -f "$drm_ctrl" 2>/dev/null
+        if mkfifo "$drm_ctrl" 2>/dev/null; then
+            session_refresh_loop "$channel_id" "$token" "$hb_url" "$hb_interval" "$dash_url" "$drm_ctrl" &
+            hb_pid=$!
+            trace "stream $kind: token-gated -> session_refresh_loop (hb_pid=$hb_pid, ctrl=$drm_ctrl); proactive switch every ${PILOT_WP_REFRESH_INTERVAL:-100}s"
+        else
+            drm_ctrl=""   # control FIFO failed -> degrade to plain heartbeat
+            heartbeat_loop "$hb_url" "$hb_interval" & hb_pid=$!
+            trace "stream $kind: token-gated but control FIFO failed -> plain heartbeat (refresh off)"
+        fi
+    else
+        heartbeat_loop "$hb_url" "$hb_interval" & hb_pid=$!
+        trace "stream $kind: token-less -> heartbeat every ${hb_interval:-20}s (hb_pid=$hb_pid); slot release detached via setsid"
+    fi
+    # dashlive logs the tracks line itself when tracing. All audio tracks are
+    # restreamed. The control FIFO + refresh-loop PID let dashlive pick up
+    # refreshed URLs and signal the loop on early 403s.
+    run_dash_pipeline "$dash_url" "$key" "$channel_name" "$audio_only" "$drm_ctrl" "$hb_pid" &
+    ff_pid=$!
+    trace "$kind ffmpeg started (ff_pid=$ff_pid) dashlive FIFOs$([[ -n "$key" ]] && echo ' + -decryption_key') -c copy -> stdout"
+    wait "$ff_pid" && rc=0 || rc=$?
+    trace "$kind ffmpeg exited rc=$rc"
+    exit "$rc"
+}
+
+for attempt in $(seq 1 "$retries"); do
+    # Optimistic auth: on the first attempt with a non-empty jar, skip the
+    # /api/v2/user pre-flight and let the channel open be the auth check (saves a
+    # round-trip). resolve_auth runs only when the jar is missing/empty or on a
+    # retry, when the jar may be stale.
+    #
+    # resolve_auth exits (2/3) on a hard auth failure, e.g. a jar that tvheadend's
+    # user can't read, or expired cookies and no creds. It runs in a subshell so
+    # that exit shows an auth slate instead of killing the tune with "no data"
+    # (its jar writes land on disk, so the subshell loses no state).
+    if [[ $attempt -gt 1 || ! -s "$PILOT_WP_COOKIES" ]]; then
+        trace "resolving auth (attempt $attempt/$retries)"
+        if ! ( resolve_auth ); then
+            trace "auth FAILED (cookie jar/creds unusable); showing auth slate"
+            slate "${PILOT_WP_SLATE_TEXT_AUTH:-Błąd uwierzytelnienia - sprawdź sesję / uprawnienia\nAuthentication failed - check the session cookies / file permissions}"
+            exit 0
+        fi
+        trace "auth ok (attempt $attempt/$retries)"
+    else
+        trace "optimistic open (attempt 1): jar present, skipping pre-flight auth probe"
+    fi
+
+    # Open, retrying a few times on the multiroom limit — a just-torn-down
+    # session elsewhere may still be clearing (incl. a prior tune of this
+    # channel that was SIGKILLed and is still auto-expiring).
+    status="" hls_url="" hb_url="" hb_interval="" token="" ch_name="" dash_url="" widevine_url=""
+    for (( li = 1; li <= limit_retries; li++ )); do
+        mapfile -t REC < <(fetch_channel "$channel_id")
+        status=${REC[0]:-error}
+        hls_url=${REC[1]:-}
+        hb_url=${REC[2]:-}
+        hb_interval=${REC[3]:-}
+        token=${REC[4]:-}
+        ch_name=${REC[5]:-}
+        dash_url=${REC[6]:-}
+        widevine_url=${REC[7]:-}
+        [[ "$status" == "limit" ]] || break
+        if (( li < limit_retries )); then
+            trace "multiroom limit; retrying in ${limit_delay}s ($li/$limit_retries)"
+            sleep "$limit_delay"
+        fi
+    done
+    trace "fetch: status=$status token=$([[ -n "$token" ]] && echo yes || echo no) hb_interval=${hb_interval:-none} name='${ch_name}'"
+
+    case "$status" in
+        ok)
+            # Prefer DASH: the HLS (MPEG-TS) of some channels stamps audio on a
+            # different PTS timeline than video, so ffmpeg's HLS demuxer never reads
+            # the audio; the DASH (fMP4) timeline is aligned. HLS is the fallback
+            # (no DASH URL, no python3, or PILOT_WP_FTA_DASH=0).
+            if [[ -n "$dash_url" ]] && fta_dash_available; then
+                trace "FTA channel; using DASH (dashlive, no key)"
+                stream_dash ""   # never returns
+            fi
+            spawn_releaser "$$" "$channel_id" "$token"
+            heartbeat_loop "$hb_url" "$hb_interval" &
+            hb_pid=$!
+            trace "stream ok: heartbeat every ${hb_interval:-20}s (hb_pid=$hb_pid); slot release detached via setsid"
+            trace_tracks "$hls_url" &   # backgrounded so the probe never delays the tune
+            # HLS fallback over HTTPS, authenticated by the t2/t3/ts tokens in the
+            # URL and gated by the impersonated UA. Do not send the session Cookie
+            # to the CDN: the jar's netviapisessval is a ~700-char JWT and the
+            # videostar CDN rejects the request with HTTP 400 when it's present.
+            #
+            # -map 0:v:0? -map 0:a? — first video + all audio tracks (main plus
+            # any "audiodeskrypcja"/alt-language renditions), so Kodi can offer
+            # audio-track selection. The `?` keeps both optional, so audio-only
+            # (radio) channels still work. (A VLC *recording* may mute because the
+            # audio-description rendition can start a few seconds out of sync;
+            # live playback through tvheadend→Kodi is unaffected.)
+            # shellcheck disable=SC2086
+            ffmpeg \
+                -hide_banner \
+                -user_agent "$PILOT_WP_UA" \
+                $PILOT_WP_HLS_FFMPEG_FLAGS \
+                -i "$hls_url" \
+                -map 0:v:0? -map 0:a? \
+                -c copy \
+                -metadata "service_provider=Pilot WP" \
+                -metadata "service_name=${channel_name}" \
+                -f mpegts -mpegts_flags +initial_discontinuity $mpegts_svc - &
+            ff_pid=$!
+            trace "ffmpeg started (ff_pid=$ff_pid) -c copy -> stdout"
+            # Exit with ffmpeg's status. On SIGTERM the cleanup trap fires and
+            # wait returns.
+            wait "$ff_pid" && rc=0 || rc=$?
+            trace "ffmpeg exited rc=$rc"
+            exit "$rc"
+            ;;
+        drm)
+            if drm_playback_available; then
+                # DRM playback enabled + a usable .wvd/pywidevine: decrypt the
+                # CENC DASH via stream_dash. pilot-wp-getkeys reads the KID from
+                # the MPD itself, then exchanges it at the Widevine license URL.
+                trace "DRM channel; playback enabled — fetching Widevine key"
+                key=""
+                if [[ -n "$dash_url" && -n "$widevine_url" ]]; then
+                    key=$("$_self_dir/pilot-wp-getkeys" "$widevine_url" "$dash_url" \
+                            2>>"${PILOT_WP_DRM_KEY_LOG:-/dev/null}") || key=""
+                fi
+                if [[ -z "$key" ]]; then
+                    # Key fetch failed (expired .wvd, license rejected, no dash/KID):
+                    # release the slot and show the slate, as the disabled path does.
+                    trace "DRM key fetch failed; releasing session, showing DRM slate"
+                    [[ -n "$token" ]] && release_stream "$channel_id" "$token" >/dev/null 2>&1 || true
+                    slate "${PILOT_WP_SLATE_TEXT_DRM:-Audycja nie może być wyświetlona - kanał chroniony przez DRM\nThe program cannot be displayed - the channel is protected by DRM}"
+                    exit 0
+                fi
+                trace "DRM key acquired; starting decrypt pipeline"
+                stream_dash "$key"   # never returns
+            else
+                # DRM playback disabled or unconfigured (PILOT_WP_DRM_ENABLE!=1,
+                # no .wvd, or pywidevine missing). The slate needs no Pilot WP
+                # session, so release the opened slot now rather than holding it
+                # for the whole slate (zapping DRM channels would otherwise pile
+                # up to the multiroom limit).
+                [[ -n "$token" ]] && release_stream "$channel_id" "$token" >/dev/null 2>&1 || true
+                trace "DRM-protected; playback disabled/unconfigured — released session, showing DRM slate"
+                slate "${PILOT_WP_SLATE_TEXT_DRM:-Audycja nie może być wyświetlona - kanał chroniony przez DRM\nThe program cannot be displayed - the channel is protected by DRM}"
+                exit 0
+            fi
+            ;;
+        limit)
+            trace "still at multiroom limit after $limit_retries tries; showing limit slate"
+            slate "${PILOT_WP_SLATE_TEXT_LIMIT:-Audycja nie może być wyświetlona - przekroczono limit transmisji\nThe program cannot be displayed - the stream limit has been reached}"
+            exit 0
+            ;;
+        *)
+            # Transient/per-channel error — retry. The jar is deliberately not
+            # wiped on a "rejected" probe: it is the only credential (headless
+            # re-login is Cloudflare-gated) and is shared by every concurrent
+            # tune. A genuinely expired session makes the next resolve_auth fail
+            # cleanly (auth slate); a transient blip recovers on retry.
+            auth=0
+            cookies_authorize || auth=$?
+            case $auth in
+                0) trace "open failed (attempt $attempt/$retries); session valid (transient/per-channel) — retrying" ;;
+                1) trace "open failed (attempt $attempt/$retries); session rejected — retrying (jar preserved)" ;;
+                2) trace "open failed (attempt $attempt/$retries); API unreachable — retrying" ;;
+            esac
+            sleep 1
+            ;;
+    esac
+done
+
+trace "giving up after $retries attempts"
+exit 5
