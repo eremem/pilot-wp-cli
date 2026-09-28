@@ -164,7 +164,7 @@ The tools:
 | `pilot-wp-favourites [list\|add\|remove …]` | Anytime | Lists and edits favourite channels; see [Managing favourites](#managing-favourites). |
 | `pilot-wp-m3u [--rescan] OUTPUT_PATH` | After login, and again when the channel lineup changes (cron optional — see [Daily channel-list refresh](#daily-channel-list-refresh-cron)) | Writes a tvheadend M3U whose entries are `pipe://` invocations of `pilot-wp-stream`; `--rescan` re-probes every channel's DRM status, ignoring the cache. No stream URLs are embedded, so it doesn't go stale when tokens expire. |
 | `pilot-wp-stream CHANNEL_ID ['NAME'] ['THUMB_URL'] [AUDIO_ONLY]` | Invoked by tvheadend per tune | Opens the channel, heartbeats it, and writes MPEG-TS to stdout; DRM (when not enabled) and over-limit channels get a slate. |
-| `diagnostics/pilot-wp-cdn-probe CHANNEL_ID [N_SEGS]` | When a DRM channel stutters | Measures whether this box can fetch the channel's segments fast enough; see [Diagnosing a stutter](#diagnosing-a-stutter). Not used during playback. |
+| `diagnostics/pilot-wp-cdn-probe [--dash\|--hls] [--wait SECS] CHANNEL_ID [N_SEGS]` | When a channel stutters | Measures whether this box can fetch the channel's segments fast enough; see [Diagnosing a stutter](#diagnosing-a-stutter). Not used during playback. |
 | `pilot-wp-common.sh` | Sourced by the others | Library; not directly runnable. |
 
 ### Generating the M3U
@@ -323,7 +323,7 @@ Endpoints and headers are constants at the top of `pilot-wp-common.sh`; if Pilot
 
 ### Diagnosing a stutter
 
-A DRM channel whose segments can't be fetched in real time stutters in a typical pattern: about once a minute tvheadend logs `tsfix: transport stream H264, DTS discontinuity` (and the same for AAC) with a constant forward jump of roughly the manifest's window (~34 s on TVN), and in between `AAC … DTS and PCR diff is very big` with a growing value. `pilot-wp-dashlive` has fallen off the back of the short live window and resynced to the live edge.
+A channel whose segments can't be fetched in real time stutters. On the DASH path it does so in a typical pattern: about once a minute tvheadend logs `tsfix: transport stream H264, DTS discontinuity` (and the same for AAC) with a constant forward jump of roughly the manifest's window (~34 s on TVN), and in between `AAC … DTS and PCR diff is very big` with a growing value. `pilot-wp-dashlive` has fallen off the back of the short live window and resynced to the live edge. On the HLS fallback, ffmpeg stalls instead.
 
 `diagnostics/pilot-wp-cdn-probe` tells you whether this box can keep up. Run it on the box, as the tvheadend user, while the channel is stuttering:
 
@@ -331,18 +331,20 @@ A DRM channel whose segments can't be fetched in real time stutters in a typical
 sudo -u xbian ./diagnostics/pilot-wp-cdn-probe 14      # 14 = TVN; optional 2nd arg = segments per track
 ```
 
-It opens the channel once (the slot is released at once), then times recent segments of the top video rendition and the audio two ways, and ends with a `VERDICT`:
+It opens the channel once and probes the path `pilot-wp-stream` plays that channel through: DASH for DRM channels and, by default, for free-to-air ones; HLS for a free-to-air channel on the fallback (no DASH URL, `PILOT_WP_FTA_DASH=0`, or no `pilot-wp-dashlive`/python3). The header shows the path and why it was chosen. `--dash` or `--hls` forces a path on a free-to-air channel, for example to compare the two before changing `PILOT_WP_FTA_DASH`; DRM channels play only through DASH. The slot is released at once, unless the URL is token-gated (videostar channels, whose URL stops working once the session closes); then it is kept alive with heartbeats until the probe exits.
 
-- **WARM** — one reused keep-alive connection, as `pilot-wp-dashlive` fetches. It must stay under the segment duration (`seg_dur`, ~2 s) for smooth playback.
+It then times recent segments of the top video rendition and the audio two ways, and ends with a `VERDICT`:
+
+- **WARM** — one reused keep-alive connection, as `pilot-wp-dashlive` (DASH) or ffmpeg (HLS) fetches. It must stay under the segment duration (`seg_dur`, ~2 s) for smooth playback.
 - **COLD** — a fresh connection per segment, which isolates connection setup (TCP/TLS handshake).
 
-The two modes fetch different, alternate segments, interleaved in time, so neither is helped by the CDN caching a segment the other just fetched. How to read the result:
+The two modes fetch different, alternate segments, interleaved in time, so neither is helped by the CDN caching a segment the other just fetched. Some manifests list only a few recent segments (videostar channels use 5 s segments). When fewer than `N_SEGS` per mode are listed, the probe keeps re-reading the manifest and times each segment as it is published, video and audio together, until it has enough or `--wait SECS` runs out (default 90; `--wait 0` uses only what is already listed). Each track's header shows how many were sampled and how many of those were awaited live. How to read the result:
 
 - **COLD slow, WARM fast** — new connections are the problem (connection tracking or socket buildup on the box; a reboot clears it).
 - **WARM slow, COLD fast** — bandwidth is fine, but long-lived connections are held up or dropped on the way (router, NAT, Wi-Fi, or the CDN node). Compare from another machine on the same network, and re-run to see whether it follows the node the probe names.
-- **Both slow** — the link or path to the CDN is the limit. Check the modem; if the transfer time dominates, cap the video with `--max-video-bw` in `PILOT_WP_DASHLIVE_ARGS` (the probe prints the next lower rung of the channel's quality ladder).
+- **Both slow** — the link or path to the CDN is the limit. Check the modem; if the transfer time dominates, cap the video with `--max-video-bw` in `PILOT_WP_DASHLIVE_ARGS` (the probe prints the next lower rung of the channel's quality ladder). The HLS fallback can't cap the bitrate; re-run with `--dash` to see whether the channel's DASH path would keep up.
 
-A keep-alive `RECONNECT` during the run means the connection was dropped mid-stream, which alone causes stalls. Only DRM channels are probed; free-to-air channels are reported and skipped.
+A keep-alive `RECONNECT` during the run means the connection was dropped mid-stream, which alone causes stalls. Failed fetches (HTTP errors) are counted and reported separately.
 
 ### Tracing
 
@@ -408,7 +410,7 @@ pilot-wp-cli/
 ├── pilot-wp-getkeys      Widevine license helper (optional DRM playback)
 ├── pilot-wp-dashlive     in-order live-DASH segment fetcher (FTA and DRM playback)
 ├── diagnostics/
-│   └── pilot-wp-cdn-probe  CDN throughput probe for a stuttering DRM channel (not used in playback)
+│   └── pilot-wp-cdn-probe  CDN throughput probe for a stuttering channel (not used in playback)
 ├── config.env.example    template for config.env (all settings optional)
 ├── widevine/             drop your own L3 .wvd here (optional DRM playback)
 ├── README.md             setup guide (Polish)

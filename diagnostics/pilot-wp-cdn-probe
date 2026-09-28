@@ -1,17 +1,25 @@
 #!/usr/bin/env bash
-# pilot-wp-cdn-probe CHANNEL_ID [N_SEGS]
+# pilot-wp-cdn-probe [--dash|--hls] [--wait SECS] CHANNEL_ID [N_SEGS]
 #
-# Diagnostic for a DRM channel that stutters (DTS discontinuities, segments fetched
-# slower than real time). It answers: can THIS box pull the channel's DASH segments
+# Diagnostic for a channel that stutters (DTS discontinuities, segments fetched
+# slower than real time). It answers: can THIS box pull the channel's segments
 # fast enough to keep up with live, and if not, where does the time go — the data
 # path (link RTT / throughput) or connection setup (TCP/TLS handshake, nf_conntrack)?
 #
 # Run it on the box while a tune is stuttering. It resolves the channel like
-# pilot-wp-stream (cookie jar, fetch_channel, impersonation UA), then times the
+# pilot-wp-stream (cookie jar, fetch_channel, impersonation UA) and probes the path
+# pilot-wp-stream would play it through:
+#
+#   DASH  DRM channels, and free-to-air ones by default (pilot-wp-dashlive)
+#   HLS   the free-to-air fallback (no DASH URL, PILOT_WP_FTA_DASH=0, or no
+#         dashlive/python3) — ffmpeg's own HLS demuxer
+#
+# --dash / --hls force a path instead (free-to-air only; DRM plays only via DASH),
+# e.g. to compare the two before changing PILOT_WP_FTA_DASH. It then times the
 # latest media segments of the top video rendition and the audio, two ways:
 #
-#   WARM  one reused keep-alive connection, as pilot-wp-dashlive uses — WARM ms/seg
-#         must stay under seg_dur (~2s) for smooth playback.
+#   WARM  one reused keep-alive connection, as the production fetcher uses — WARM
+#         ms/seg must stay under the segment duration for smooth playback.
 #   COLD  a fresh connection per segment — isolates connect+handshake cost.
 #
 # WARM and COLD fetch DIFFERENT segments (alternate ones of the same recent run),
@@ -23,17 +31,43 @@
 #                            (router/NAT/Wi-Fi, or the CDN node) — not bandwidth
 #   both slow             => the link path itself (latency or bandwidth)
 #
-# The slot opened to read the manifest is released immediately. Only DRM channels
-# (status=drm) are probed; free-to-air channels are reported and skipped. Deps: the
-# suite's own (curl, jq) plus python3 stdlib.
+# The slot opened to read the manifest is released immediately, unless the URL is
+# token-gated (videostar: its tokens die with the session); then it is held, with
+# heartbeats, until the probe exits.
+#
+# A short manifest window (a handful of long segments, e.g. videostar's 5 s ones)
+# lists fewer than N_SEGS pairs. The probe then re-reads the manifest and times
+# segments as they are published — video and audio in the same rounds, as
+# pilot-wp-dashlive fetches them — until it has N_SEGS per mode or --wait SECS
+# (default 90, 0 = off) runs out. Deps: the suite's own (curl, jq) plus python3
+# stdlib.
 set -euo pipefail
 
-channel_id="${1:?usage: pilot-wp-cdn-probe CHANNEL_ID [N_SEGS]}"
-nseg="${2:-8}"
+usage="usage: pilot-wp-cdn-probe [--dash|--hls] [--wait SECS] CHANNEL_ID [N_SEGS]"
+force="" wait=90 args=()
+while (( $# )); do
+    case "$1" in
+        --dash|--hls) force=${1#--} ;;
+        --wait)       [[ $# -ge 2 ]] || { echo "$usage" >&2; exit 2; }; wait=$2; shift ;;
+        --wait=*)     wait=${1#*=} ;;
+        -h|--help)    echo "$usage"; exit 0 ;;
+        -*)           echo "pilot-wp-cdn-probe: unknown option $1" >&2; echo "$usage" >&2; exit 2 ;;
+        *)            args+=("$1") ;;
+    esac
+    shift
+done
+channel_id="${args[0]:-}"
+nseg="${args[1]:-8}"
+[[ -n "$channel_id" ]] || { echo "$usage" >&2; exit 2; }
+[[ "$nseg" =~ ^[1-9][0-9]*$ ]] || { echo "pilot-wp-cdn-probe: N_SEGS must be a positive integer" >&2; exit 2; }
+[[ "$wait" =~ ^[0-9]+$ ]] || { echo "pilot-wp-cdn-probe: --wait takes whole seconds (0 = don't wait)" >&2; exit 2; }
 
 _self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
 # shellcheck source=pilot-wp-common.sh
 source "$_self_dir/../pilot-wp-common.sh"
+
+PY="${PILOT_WP_PYTHON:-python3}"
+command -v "$PY" >/dev/null 2>&1 || { echo "pilot-wp-cdn-probe: needs python3 ($PY not found)" >&2; exit 1; }
 
 # Only fall back to resolve_auth when the jar is missing/empty, so a normal box
 # run stays non-interactive.
@@ -41,156 +75,428 @@ if [[ ! -s "$PILOT_WP_COOKIES" ]]; then
     resolve_auth || { echo "pilot-wp-cdn-probe: no usable session (run pilot-wp-login)" >&2; exit 1; }
 fi
 
+hb_pid="" token=""
+# Free the slot (and stop its heartbeat) — on every exit path, Ctrl-C included.
+release_slot() {
+    [[ -n "$hb_pid" ]] && kill "$hb_pid" 2>/dev/null
+    [[ -n "$token" ]] && release_stream "$channel_id" "$token" >/dev/null 2>&1
+    hb_pid="" token=""
+}
+trap release_slot EXIT
+trap 'exit 130' INT TERM
+
 mapfile -t REC < <(fetch_channel "$channel_id")
 status=${REC[0]:-error}
+hls_url=${REC[1]:-}
+hb_url=${REC[2]:-}
+hb_interval=${REC[3]:-}
 token=${REC[4]:-}
 ch_name=${REC[5]:-}
 dash_url=${REC[6]:-}
-# Free the slot at once — we only needed the manifest URL, not a held session.
-[[ -n "$token" ]] && release_stream "$channel_id" "$token" >/dev/null 2>&1 || true
 
 echo "pilot-wp-cdn-probe: channel $channel_id (${ch_name:-?})  status=$status"
 case "$status" in
-    drm) : ;;
-    ok)    echo "  -> free-to-air channel; this probe only targets DRM channels (e.g. TVN). Nothing to do."; exit 0 ;;
+    drm)   kind=DRM ;;
+    ok)    kind=FTA ;;
     limit) echo "  -> multiroom limit reached; can't open the channel to read its manifest right now."; exit 0 ;;
     *)     echo "  -> could not resolve channel (status=$status); is the session valid? try pilot-wp-login." >&2; exit 1 ;;
 esac
-[[ -n "$dash_url" ]] || { echo "  -> no DASH URL in the channel response." >&2; exit 1; }
-echo "  dash_url: $dash_url"
+
+# The path pilot-wp-stream takes for this channel (mirrors its `case "$status"`).
+if [[ "$kind" == DRM ]]; then
+    prod=dash why="DRM channels always play through DASH"
+elif [[ -n "$dash_url" ]] && fta_dash_available; then
+    prod=dash why="free-to-air, DASH available"
+elif [[ -z "$dash_url" ]]; then
+    prod=hls why="free-to-air, no DASH URL"
+elif [[ "${PILOT_WP_FTA_DASH:-1}" != 1 ]]; then
+    prod=hls why="free-to-air, PILOT_WP_FTA_DASH=${PILOT_WP_FTA_DASH}"
+else
+    prod=hls why="free-to-air, pilot-wp-dashlive or $PY unavailable"
+fi
+path=${force:-$prod}
+if [[ "$kind" == DRM && "$path" == hls ]]; then
+    echo "  -> DRM channels play only through DASH; --hls doesn't apply." >&2; exit 2
+fi
+if [[ "$path" == dash ]]; then url=$dash_url; else url=$hls_url; fi
+[[ -n "$url" ]] || { echo "  -> no ${path^^} URL in the channel response." >&2; exit 1; }
+
+# Token-gated (videostar) URLs die with the session, so hold the slot for the run
+# and keep it alive with heartbeats (the run is well inside the ~3 min before
+# pilot-wp-stream would need a session switch). Token-less (redcdn) URLs outlive
+# the session: free the slot at once.
+if is_token_gated "$url"; then
+    slot="held for the run (token-gated URL), released on exit"
+    if [[ -n "$hb_url" ]]; then
+        [[ "$hb_interval" =~ ^[0-9]+$ ]] || hb_interval=20
+        ( while sleep "$hb_interval"; do heartbeat_once "$hb_url" >/dev/null 2>&1 || true; done ) &
+        hb_pid=$!
+    fi
+else
+    release_slot
+    slot="released (URL not token-gated)"
+fi
+
+if [[ -z "$force" ]]; then
+    note="what pilot-wp-stream uses: $why"
+elif [[ "$force" == "$prod" ]]; then
+    note="forced; pilot-wp-stream uses it too: $why"
+else
+    note="forced; pilot-wp-stream uses ${prod^^}: $why"
+fi
+echo "  type:     $kind"
+echo "  path:     ${path^^}  ($note)"
+echo "  url:      $url"
+echo "  slot:     $slot"
 echo "  UA:       $PILOT_WP_UA"
-echo "  sampling: up to $nseg segments per track for WARM and $nseg different ones for COLD,"
-echo "            interleaved, a couple back from the live edge"
+echo "  sampling: $nseg segments per track for WARM and $nseg different ones for COLD, interleaved,"
+if (( wait > 0 )); then
+    echo "            from the newest published ones; on a short manifest window, waits up to ${wait}s"
+    echo "            for newly published segments"
+else
+    echo "            from the newest published ones (--wait 0: only those already listed)"
+fi
 echo
 
-PY="${PILOT_WP_PYTHON:-python3}"
-"$PY" - "$dash_url" "$PILOT_WP_UA" "$nseg" <<'PY'
-import sys, time, ssl, http.client, urllib.request, urllib.parse
+"$PY" - "$path" "$url" "$PILOT_WP_UA" "$nseg" "$wait" <<'PY'
+import sys, re, time, ssl, http.client, urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
+from datetime import datetime
 
-dash_url, ua, nseg = sys.argv[1], sys.argv[2], int(sys.argv[3] or "8")
+mode, url, ua, nseg, wait = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4] or "8"), int(sys.argv[5] or "90")
 ln  = lambda t: t.rsplit("}", 1)[-1]
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 
-def get_mpd(url):
-    req = urllib.request.Request(url, headers={"User-Agent": ua})
+def get(u):
+    req = urllib.request.Request(u, headers={"User-Agent": ua})
     t0 = time.monotonic()
     with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
         return r.read(), r.geturl(), time.monotonic() - t0
 
-raw, eff, mpd_t = get_mpd(dash_url)
-root    = ET.fromstring(raw)
-base    = next((e.text.strip() for e in root.iter() if ln(e.tag) == "BaseURL" and e.text), eff)
-periods = [e for e in root.iter() if ln(e.tag) == "Period"]
-period  = periods[-1] if periods else root
-node    = urllib.parse.urlparse(base).netloc
-print(f"node: {node}   MPD fetch {mpd_t*1000:.0f}ms   periods={len(periods)}\n")
+def split_url(u):
+    p = urllib.parse.urlparse(u)
+    return (p.scheme, p.netloc), p.path + ("?" + p.query if p.query else "")
 
-def seg_template(aset):
-    tmpl  = next(e for e in aset.iter() if ln(e.tag) == "SegmentTemplate")
-    media = tmpl.attrib["media"]
-    scale = float(tmpl.attrib.get("timescale", "1") or "1")
-    stl   = next(e for e in tmpl.iter() if ln(e.tag) == "SegmentTimeline")
-    times, t, d = [], None, None
-    for s in (e for e in stl.iter() if ln(e.tag) == "S"):
-        if "t" in s.attrib: t = int(s.attrib["t"])
-        d = int(s.attrib["d"]); r = int(s.attrib.get("r", "0"))
-        for _ in range(r + 1):
-            times.append(t); t += d
-    return media, times, (d / scale if d else 2.0)
+def new_conn(host):
+    scheme, netloc = host
+    if scheme == "https":
+        return http.client.HTTPSConnection(netloc, timeout=20, context=ctx)
+    return http.client.HTTPConnection(netloc, timeout=20)
 
-def hp(media, rep, t):
-    rid, bw = rep.attrib["id"], rep.attrib.get("bandwidth", "0")
-    q = media.replace("$RepresentationID$", rid).replace("$Bandwidth$", bw).replace("$Time$", str(t))
-    u = urllib.parse.urlparse(base + q)
-    return u.netloc, u.path + ("?" + u.query if u.query else "")
+class Track:
+    # One probed rendition: its WARM connection, running totals and output lines.
+    # Segments are (key, url), oldest first; keys ($Time$, $Number$ or the HLS media
+    # sequence) only grow, which is how newly published ones are spotted.
+    def __init__(self, label, bw, seg_dur, note, segs):
+        self.label, self.bw, self.seg_dur, self.note = label, bw, seg_dur, note
+        self.lines, self.extra = [], []
+        self.host = self.conn = None
+        self.wb = self.wt = self.wx = 0.0; self.n_ok = self.reconnects = self.warm_err = 0
+        self.cc = self.ct = self.cx = 0.0; self.ck = self.cold_err = 0
+        # Backlog: the newest 2*N listed segments as (WARM, COLD) pairs of neighbours,
+        # so neither mode re-fetches a segment the CDN just served to the other. An
+        # odd count drops the oldest.
+        run = segs[-2 * nseg:]
+        run = run[len(run) % 2:]
+        self.queue = [(run[i], run[i + 1]) for i in range(0, len(run), 2)]
+        self.backlog, self.pairs, self.pending = len(self.queue), 0, []
+        self.last = segs[-1][0] if segs else None
 
-def probe(label, aset, rep):
-    media, times, seg_dur = seg_template(aset)
-    # The newest 2*n segments short of the last two (not yet fully published), split
-    # alternately: even ones for WARM, odd ones for COLD. Shrinks n on a short window.
-    usable = times[:-2] if len(times) > 2 else times[:-1]
-    n = max(1, min(nseg, len(usable) // 2))
-    run = usable[-2 * n:]
-    warm_seg, cold_seg = run[0::2], run[1::2]
-    bw = int(rep.attrib.get("bandwidth", "0"))
-    print(f"== {label}  rep id={rep.attrib['id']}  bw={bw/1e6:.3f} Mbps  seg_dur={seg_dur:.2f}s "
-          f"(must fetch each seg in <= {seg_dur:.2f}s to keep up)  n={n} per mode ==")
+    def need(self):
+        return self.pairs + len(self.queue) < nseg
 
-    # WARM — one reused keep-alive connection (mirrors production dashlive); COLD —
-    # a fresh connection per segment (connect + handshake counted). Interleaved.
-    netloc = hp(media, rep, warm_seg[0])[0]
-    conn = http.client.HTTPSConnection(netloc, timeout=20, context=ctx)
-    wb = wt = wx = 0.0; n_ok = 0; reconnects = 0
-    cc = ct = cx = 0.0; ck = 0; cold_err = 0
-    for tw, tc in zip(warm_seg, cold_seg):
-        path = hp(media, rep, tw)[1]
+    def feed(self, segs):
+        # Queue pairs from the segments published since the last look.
+        new = [s for s in segs if self.last is None or s[0] > self.last]
+        if new: self.last = new[-1][0]
+        self.pending += new
+        while len(self.pending) >= 2 and self.need():
+            self.queue.append((self.pending[0], self.pending[1])); del self.pending[:2]
+
+    def drain(self):
+        while self.queue:
+            (kw, uw), (kc, uc) = self.queue.pop(0)
+            self.fetch_warm(kw, uw); self.fetch_cold(kc, uc); self.pairs += 1
+
+    def fetch_warm(self, k, u):
+        # One reused keep-alive connection (mirrors the production fetcher; a new one
+        # only when the segment host changes).
+        h, path = split_url(u)
+        if h != self.host:
+            if self.conn: self.conn.close()
+            self.host, self.conn = h, new_conn(h)
         try:
-            t0 = time.monotonic(); conn.request("GET", path, headers={"User-Agent": ua})
-            r = conn.getresponse(); t1 = time.monotonic(); data = r.read(); t2 = time.monotonic()
+            t0 = time.monotonic(); self.conn.request("GET", path, headers={"User-Agent": ua})
+            r = self.conn.getresponse(); t1 = time.monotonic(); data = r.read(); t2 = time.monotonic()
         except Exception as e:
-            reconnects += 1
-            try: conn.close()
+            self.reconnects += 1
+            try: self.conn.close()
             except Exception: pass
-            conn = http.client.HTTPSConnection(netloc, timeout=20, context=ctx)
-            print(f"   warm t={tw}: RECONNECT after {type(e).__name__}: {e}")
-        else:
-            ttfb, xfer = t1 - t0, t2 - t1
-            wb += len(data); wt += ttfb; wx += xfer; n_ok += 1
-            print(f"   warm t={tw}: {len(data)/1024:7.1f} KB  TTFB={ttfb*1000:6.0f}ms  "
-                  f"xfer={xfer*1000:6.0f}ms  total={(ttfb+xfer)*1000:6.0f}ms")
+            self.conn = new_conn(self.host)
+            self.lines.append(f"   warm seg {k}: RECONNECT after {type(e).__name__}: {e}")
+            return
+        if r.status != 200:
+            self.warm_err += 1
+            self.lines.append(f"   warm seg {k}: HTTP {r.status}")
+            return
+        ttfb, xfer = t1 - t0, t2 - t1
+        self.wb += len(data); self.wt += ttfb; self.wx += xfer; self.n_ok += 1
+        self.lines.append(f"   warm seg {k}: {len(data)/1024:7.1f} KB  TTFB={ttfb*1000:6.0f}ms  "
+                          f"xfer={xfer*1000:6.0f}ms  total={(ttfb+xfer)*1000:6.0f}ms")
 
-        cnetloc, cpath = hp(media, rep, tc)
+    def fetch_cold(self, k, u):
+        # A fresh connection per segment: connect + handshake counted.
+        host, path = split_url(u)
         try:
             t0 = time.monotonic()
-            c = http.client.HTTPSConnection(cnetloc, timeout=20, context=ctx); c.connect()
-            tC = time.monotonic(); c.request("GET", cpath, headers={"User-Agent": ua})
-            r = c.getresponse(); tH = time.monotonic(); cdata = r.read(); tD = time.monotonic(); c.close()
+            c = new_conn(host); c.connect()
+            tC = time.monotonic(); c.request("GET", path, headers={"User-Agent": ua})
+            r = c.getresponse(); tH = time.monotonic(); data = r.read(); tD = time.monotonic(); c.close()
         except Exception as e:
-            cold_err += 1
-            print(f"   cold t={tc}: ERROR {type(e).__name__}: {e}")
-        else:
-            cc += tC - t0; ct += tH - tC; cx += tD - tH; ck += 1
-            print(f"   cold t={tc}: {len(cdata)/1024:7.1f} KB  connect={(tC-t0)*1000:5.0f}ms  "
-                  f"TTFB={(tH-tC)*1000:6.0f}ms  xfer={(tD-tH)*1000:6.0f}ms  total={(tD-t0)*1000:6.0f}ms")
-    conn.close()
+            self.cold_err += 1
+            self.lines.append(f"   cold seg {k}: ERROR {type(e).__name__}: {e}")
+            return
+        if r.status != 200:
+            self.cold_err += 1
+            self.lines.append(f"   cold seg {k}: HTTP {r.status}")
+            return
+        self.cc += tC - t0; self.ct += tH - tC; self.cx += tD - tH; self.ck += 1
+        self.lines.append(f"   cold seg {k}: {len(data)/1024:7.1f} KB  connect={(tC-t0)*1000:5.0f}ms  "
+                          f"TTFB={(tH-tC)*1000:6.0f}ms  xfer={(tD-tH)*1000:6.0f}ms  total={(tD-t0)*1000:6.0f}ms")
 
-    k = n_ok or 1
-    warm_per = (wt + wx) / k
-    mbps = wb * 8 / 1e6 / (wt + wx) if (wt + wx) else 0
-    print(f"   WARM avg: TTFB {wt/k*1000:.0f}ms + xfer {wx/k*1000:.0f}ms = {warm_per*1000:.0f}ms/seg "
-          f"({mbps:.1f} Mbps){'  RECONNECTS=' + str(reconnects) if reconnects else ''}")
-    kc = ck or 1
-    cold_per = (cc + ct + cx) / kc
-    print(f"   COLD avg: connect {cc/kc*1000:.0f}ms + TTFB {ct/kc*1000:.0f}ms + xfer {cx/kc*1000:.0f}ms "
-          f"= {cold_per*1000:.0f}ms/seg{'  ERRORS=' + str(cold_err) if cold_err else ''}\n")
-    return dict(label=label, seg_dur=seg_dur, warm=warm_per, cold=cold_per,
-                warm_ttfb=wt/k, warm_xfer=wx/k, reconnects=reconnects,
-                warm_ok=n_ok, cold_ok=ck, cold_err=cold_err)
+    def report(self):
+        if self.conn: self.conn.close()
+        sd, live = self.seg_dur, self.pairs - self.backlog
+        got = f"n={self.pairs} per mode" + (f" of {nseg} wanted" if self.pairs < nseg else "") \
+              + (f", {live} awaited live" if live else "")
+        print(f"== {self.label}  {self.note}{f'bw={self.bw/1e6:.3f} Mbps  ' if self.bw else ''}"
+              f"seg_dur={sd:.2f}s (must fetch each seg in <= {sd:.2f}s to keep up)  {got} ==")
+        for l in self.lines: print(l)
+        k = self.n_ok or 1
+        warm_per = (self.wt + self.wx) / k
+        mbps = self.wb * 8 / 1e6 / (self.wt + self.wx) if (self.wt + self.wx) else 0
+        print(f"   WARM avg: TTFB {self.wt/k*1000:.0f}ms + xfer {self.wx/k*1000:.0f}ms = {warm_per*1000:.0f}ms/seg "
+              f"({mbps:.1f} Mbps){'  RECONNECTS=' + str(self.reconnects) if self.reconnects else ''}"
+              f"{'  ERRORS=' + str(self.warm_err) if self.warm_err else ''}")
+        kc = self.ck or 1
+        cold_per = (self.cc + self.ct + self.cx) / kc
+        print(f"   COLD avg: connect {self.cc/kc*1000:.0f}ms + TTFB {self.ct/kc*1000:.0f}ms + xfer {self.cx/kc*1000:.0f}ms "
+              f"= {cold_per*1000:.0f}ms/seg{'  ERRORS=' + str(self.cold_err) if self.cold_err else ''}\n")
+        for l in self.extra: print(l)
+        return dict(label=self.label, seg_dur=sd, warm=warm_per, cold=cold_per,
+                    warm_ttfb=self.wt/k, warm_xfer=self.wx/k, reconnects=self.reconnects,
+                    warm_ok=self.n_ok, cold_ok=self.ck, warm_err=self.warm_err, cold_err=self.cold_err)
 
-def first(period, ct):
-    return next((a for a in period.iter()
-                 if ln(a.tag) == "AdaptationSet" and a.attrib.get("contentType") == ct), None)
+def sample(tracks, refresh):
+    # The listed backlog first. While a track is still short of N pairs (a short
+    # manifest window), re-read the manifest every half segment and time segments as
+    # they are published — all tracks in the same rounds, as pilot-wp-dashlive
+    # fetches them — until every track has N or `wait` seconds pass.
+    for t in tracks: t.drain()
+    if wait <= 0 or not any(t.need() for t in tracks):
+        return
+    short = ", ".join(f"{t.label} {t.pairs}" for t in tracks if t.need())
+    print(f"short manifest window ({short} of {nseg} pairs listed): waiting up to {wait}s for newly "
+          f"published segments ...", flush=True)
+    t0 = time.monotonic()
+    while any(t.need() for t in tracks) and time.monotonic() - t0 < wait:
+        time.sleep(max(1.0, min(t.seg_dur for t in tracks if t.need()) / 2))
+        try:
+            lists = refresh()
+        except Exception as e:
+            print(f"   manifest refresh failed ({type(e).__name__}: {e}); stopped waiting")
+            break
+        for t in tracks:
+            if t.need() and t.label in lists:
+                t.feed(lists[t.label]); t.drain()
+    print(f"   waited {time.monotonic() - t0:.0f}s\n", flush=True)
 
-vset = first(period, "video"); aset = first(period, "audio")
-res = []
-if vset is not None:
-    reps = [e for e in vset.iter() if ln(e.tag) == "Representation"]
-    top  = max(reps, key=lambda r: int(r.attrib.get("bandwidth", "0")))
-    res.append(probe("VIDEO", vset, top))
-    ladder = sorted(int(r.attrib.get("bandwidth", "0")) for r in reps)
-    print("   video ladder (Mbps): " + ", ".join(f"{b/1e6:.3f}" for b in ladder))
-    lower = [b for b in ladder if b < max(ladder)]
-    if lower:
-        print(f"   -> PILOT_WP_DASHLIVE_ARGS=\"--max-video-bw {lower[-1]}\" would drop to the {lower[-1]/1e6:.3f} Mbps rung\n")
-if aset is not None:
-    reps = [e for e in aset.iter() if ln(e.tag) == "Representation"]
-    res.append(probe("AUDIO", aset, reps[0]))
+# ---- DASH (pilot-wp-dashlive) --------------------------------------------------
+def track_sets(scope, ct):
+    # As pilot-wp-dashlive: contentType first, mimeType prefix as the fallback.
+    sets = [a for a in scope.iter() if ln(a.tag) == "AdaptationSet" and a.attrib.get("contentType") == ct]
+    return sets or [a for a in scope.iter()
+                    if ln(a.tag) == "AdaptationSet" and a.attrib.get("mimeType", "").startswith(ct)]
+
+def ast_epoch(root):
+    s = root.attrib.get("availabilityStartTime")
+    try: return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() if s else 0.0
+    except Exception: return 0.0
+
+def iso_dur(s, default):
+    m = re.fullmatch(r"PT(?:([\d.]+)H)?(?:([\d.]+)M)?(?:([\d.]+)S)?", s or "")
+    if not m or not any(m.groups()): return default
+    h, mi, se = (float(x or 0) for x in m.groups())
+    return h * 3600 + mi * 60 + se
+
+def dash_segments(root, tmpl):
+    # Published segment keys, the media placeholder and the segment duration (s),
+    # mirroring pilot-wp-dashlive's list_segments: SegmentTimeline + $Time$, or
+    # SegmentTemplate@duration + $Number$ (index derived from the wall clock).
+    scale = float(tmpl.attrib.get("timescale", "1") or "1")
+    media = tmpl.attrib["media"]
+    stl = next((e for e in tmpl.iter() if ln(e.tag) == "SegmentTimeline"), None)
+    if stl is not None and "$Time$" in media:
+        times, t, d = [], None, None
+        for s in (e for e in stl if ln(e.tag) == "S"):
+            if "t" in s.attrib: t = int(s.attrib["t"])
+            d = int(s.attrib["d"]); r = int(s.attrib.get("r", "0"))
+            for _ in range(r + 1):
+                times.append(t); t += d
+        # Skip the last two: listed but possibly not fully published yet.
+        usable = times[:-2] if len(times) > 2 else times[:-1]
+        return usable, "$Time$", (d / scale if d else 2.0)
+    dur = float(tmpl.attrib.get("duration", "0") or "0")
+    seg_dur = dur / scale if dur else 4.0
+    start_n = int(tmpl.attrib.get("startNumber", "1") or "1")
+    tsbd = iso_dur(root.attrib.get("timeShiftBufferDepth"), 60.0)
+    live_n = start_n + int((time.time() - ast_epoch(root)) / seg_dur) - 1   # last fully-published
+    first_n = max(start_n, live_n - int(tsbd / seg_dur) + 1)
+    # Skip the newest one too (a publish race), like the $Time$ branch.
+    return list(range(first_n, live_n)), "$Number$", seg_dur
+
+def bwof(rep):
+    return int(rep.attrib.get("bandwidth", "0"))
+
+def load_mpd():
+    raw, eff, mpd_t = get(url)
+    root = ET.fromstring(raw)
+    base = next((e.text.strip() for e in root.iter() if ln(e.tag) == "BaseURL" and e.text), eff)
+    return root, base, mpd_t
+
+def dash_tracks(root, base):
+    # {LABEL: (reps, rep, segs, seg_dur, placeholder)} for the live-edge Period's first
+    # video set (top rendition) and first audio set (first rendition).
+    periods = [e for e in root.iter() if ln(e.tag) == "Period"]
+    period  = periods[-1] if periods else root
+    out = {}
+    for ct in ("video", "audio"):
+        sets = track_sets(period, ct)
+        if not sets:
+            continue
+        aset = sets[0]
+        reps = [e for e in aset.iter() if ln(e.tag) == "Representation"]
+        rep  = max(reps, key=bwof) if ct == "video" else reps[0]
+        tmpl = next(e for e in aset.iter() if ln(e.tag) == "SegmentTemplate")
+        keys, ph, seg_dur = dash_segments(root, tmpl)
+        media = (tmpl.attrib["media"].replace("$RepresentationID$", rep.attrib["id"])
+                                     .replace("$Bandwidth$", rep.attrib.get("bandwidth", "0")))
+        out[ct.upper()] = (reps, rep, [(k, base + media.replace(ph, str(k))) for k in keys], seg_dur, ph)
+    return out
+
+def run_dash():
+    root, base, mpd_t = load_mpd()
+    node = urllib.parse.urlparse(base).netloc
+    print(f"node: {node}   MPD fetch {mpd_t*1000:.0f}ms   "
+          f"periods={sum(1 for e in root.iter() if ln(e.tag) == 'Period')}\n")
+    tracks = []
+    for label, (reps, rep, segs, seg_dur, ph) in dash_tracks(root, base).items():
+        t = Track(label, bwof(rep), seg_dur, f"rep id={rep.attrib['id']}  {ph}  ", segs)
+        if label == "VIDEO":
+            ladder = sorted(bwof(r) for r in reps)
+            t.extra.append("   video ladder (Mbps): " + ", ".join(f"{b/1e6:.3f}" for b in ladder))
+            lower = [b for b in ladder if b < max(ladder)]
+            if lower:
+                t.extra.append(f"   -> PILOT_WP_DASHLIVE_ARGS=\"--max-video-bw {lower[-1]}\" would drop to "
+                               f"the {lower[-1]/1e6:.3f} Mbps rung\n")
+        tracks.append(t)
+    def refresh():
+        root, base, _ = load_mpd()
+        return {label: v[2] for label, v in dash_tracks(root, base).items()}
+    return tracks, refresh, node
+
+# ---- HLS (the free-to-air fallback: ffmpeg's HLS demuxer) -----------------------
+ATTR = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^",]*)')
+def attrs(line):
+    return {k: v.strip('"') for k, v in ATTR.findall(line.split(":", 1)[1])}
+
+def media_playlist(u):
+    # Segment URLs (relative ones resolved like ffmpeg: against the playlist URL)
+    # keyed by media sequence number, and the mean #EXTINF duration.
+    raw, eff, pt = get(u)
+    seq, durs, segs, dur = 0, [], [], None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            seq = int(line.split(":", 1)[1])
+        elif line.startswith("#EXTINF:"):
+            dur = float(line[8:].split(",")[0])
+        elif line and not line.startswith("#"):
+            segs.append((seq + len(segs), urllib.parse.urljoin(eff, line))); durs.append(dur or 0.0)
+    seg_dur = sum(durs) / len(durs) if durs else 2.0
+    return segs, seg_dur, pt
+
+def run_hls():
+    raw, eff, mt = get(url)
+    text = raw.decode("utf-8", "replace")
+    specs = []   # (label, bandwidth, playlist url)
+    ladder = []
+    if "#EXT-X-STREAM-INF" not in text:
+        specs.append(("STREAM", 0, eff))   # a bare media playlist
+    else:
+        lines = [l.strip() for l in text.splitlines()]
+        variants, audio = [], []
+        for i, l in enumerate(lines):
+            if l.startswith("#EXT-X-STREAM-INF:"):
+                uri = next((x for x in lines[i + 1:] if x and not x.startswith("#")), None)
+                if uri: variants.append((attrs(l), urllib.parse.urljoin(eff, uri)))
+            elif l.startswith("#EXT-X-MEDIA:"):
+                a = attrs(l)
+                if a.get("TYPE") == "AUDIO" and a.get("URI"):
+                    audio.append((a, urllib.parse.urljoin(eff, a["URI"])))
+        vbw   = lambda v: int(v[0].get("BANDWIDTH", "0"))
+        video = [v for v in variants if "RESOLUTION" in v[0]]
+        if video:
+            top = max(video, key=vbw)
+            specs.append(("VIDEO" if audio else "STREAM", vbw(top), top[1]))
+            ladder = sorted(map(vbw, video))
+            # The top variant's audio group, its DEFAULT=YES rendition first.
+            group = [x for x in audio if x[0].get("GROUP-ID") == top[0].get("AUDIO")] or audio
+            if group:
+                pick = next((x for x in group if x[0].get("DEFAULT") == "YES"), group[0])
+                specs.append(("AUDIO", 0, pick[1]))
+        elif variants:
+            top = max(variants, key=vbw)   # audio-only (radio): its top rung
+            specs.append(("AUDIO", vbw(top), top[1]))
+    node = urllib.parse.urlparse(specs[0][2]).netloc if specs else "?"
+    print(f"node: {node}   playlist fetch {mt*1000:.0f}ms"
+          f"{'   (audio muxed into the video segments)' if specs and specs[0][0] == 'STREAM' else ''}")
+    if ladder:
+        print("video ladder (Mbps): " + ", ".join(f"{b/1e6:.3f}" for b in ladder))
+    print()
+    tracks = []
+    for label, bw, pu in specs:
+        segs, seg_dur, pt = media_playlist(pu)
+        tracks.append(Track(label, bw, seg_dur, f"playlist {pt*1000:.0f}ms  ", segs))
+    def refresh():
+        return {label: media_playlist(pu)[0] for label, _, pu in specs}
+    return tracks, refresh, node
+
+try:
+    tracks, refresh, node = run_dash() if mode == "dash" else run_hls()
+except urllib.error.HTTPError as e:
+    print(f"manifest/playlist fetch failed: HTTP {e.code} {e.reason}\n   {e.url}")
+    if e.code == 403:
+        print("   -> the URL's tokens were refused (session closed or expired); re-run the probe.")
+    sys.exit(1)
+except (urllib.error.URLError, OSError) as e:
+    print(f"manifest/playlist fetch failed: {type(e).__name__}: {e}")
+    sys.exit(1)
+try:
+    sample(tracks, refresh)
+except KeyboardInterrupt:
+    sys.exit(130)
+res = [t.report() for t in tracks]
 
 # ---- verdict -----------------------------------------------------------------
 print("VERDICT")
+if not res:
+    print("  no track could be probed (no video/audio segments found in the manifest).")
 for r in res:
     sd = r["seg_dur"]; warm = r["warm"]; cold = r["cold"]; lab = r["label"]
+    if r["warm_err"] or r["cold_err"]:
+        print(f"  {lab}: {r['warm_err']} WARM / {r['cold_err']} COLD fetch(es) failed (HTTP error or "
+              f"connection error) — failed fetches stall playback on their own.")
     if not r["warm_ok"] or not r["cold_ok"]:
         print(f"  {lab}: not enough successful fetches (WARM {r['warm_ok']}, COLD {r['cold_ok']}) for a "
               f"verdict — the path is failing outright; run the probe again.")
@@ -213,11 +519,16 @@ for r in res:
               f"(router/NAT/Wi-Fi, or the CDN node {node}). Compare from another machine on the same "
               f"network and re-run to see whether it follows the node.")
     else:
-        dom = "transfer (bandwidth)" if r["warm_xfer"] > r["warm_ttfb"] else "TTFB/latency (link RTT or server wait)"
+        xfer_bound = r["warm_xfer"] > r["warm_ttfb"]
+        dom = "transfer (bandwidth)" if xfer_bound else "TTFB/latency (link RTT or server wait)"
         print(f"  {lab}: WARM {warm*1000:.0f}ms/seg and COLD {cold*1000:.0f}ms/seg > {sd*1000:.0f}ms "
               f"budget -> CANNOT keep up on any connection. Dominated by {dom}.")
-        if lab == "VIDEO" and r["warm_xfer"] > r["warm_ttfb"]:
-            print(f"          -> capping the video bitrate (--max-video-bw in PILOT_WP_DASHLIVE_ARGS) should help.")
+        if lab in ("VIDEO", "STREAM") and xfer_bound:
+            if mode == "dash":
+                print(f"          -> capping the video bitrate (--max-video-bw in PILOT_WP_DASHLIVE_ARGS) should help.")
+            else:
+                print(f"          -> the HLS path can't cap the bitrate; the DASH path can (--max-video-bw in "
+                      f"PILOT_WP_DASHLIVE_ARGS). Re-run with --dash to see whether this channel has it.")
         else:
             print(f"          -> a bitrate cap won't fix latency; this is the link/path (compare against a "
                   f"healthy box or run from elsewhere).")
