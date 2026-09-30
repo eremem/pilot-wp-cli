@@ -226,8 +226,9 @@ class Fetcher:
         # All AdaptationSets of a content type across the whole document, in document
         # order. This is the per-index contract for the streaming threads: audio
         # track i == adaptation_sets[i]. While a DAI ad splice briefly exposes two
-        # Periods, the outgoing Period's sets sort first, so a worker keeps reading
-        # it until it drops and the index then lands on the new Period's set.
+        # Periods, the outgoing Period's sets sort first, so the index stays on it
+        # until it drops and then lands on the new Period's set (the segments are
+        # chained across both meanwhile: list_track_segments).
         # Hazard: because this flattens across Periods, during a splice it returns
         # each logical track once per Period. Never use len() of it to count tracks
         # — that spawns a phantom worker whose set_index goes out of range when the
@@ -338,6 +339,36 @@ class Fetcher:
         first_n = max(start_n, live_n - int(tsbd / seg_dur) + 1)
         out = [(n, ast + (n - start_n) * seg_dur) for n in range(first_n, live_n + 1)]
         return out, "$Number$", seg_dur
+
+    def list_track_segments(self, root, aset, content_type, set_index):
+        # list_segments() for the steady-state poll, joined across Periods. While a
+        # DAI ad splice exposes two Periods, `aset` is the outgoing Period's set (see
+        # adaptation_sets): its list no longer grows, so on its own the worker would
+        # fetch nothing until that Period drops out of the manifest (~the window)
+        # and never its last `behind` segments — a stall, then a forward DTS gap.
+        # $Time$ keys run on across Periods, so chain each Period's set for this
+        # track (set_index within the Period) in document order; `behind` then trims
+        # only the live edge. Anything else (one Period, $Number$) -> `aset` alone.
+        segs, ph, seg_dur = self.list_segments(root, aset)
+        periods = [e for e in root.iter() if localname(e.tag) == "Period"]
+        if ph != "$Time$" or len(periods) < 2:
+            return segs, ph, seg_dur
+        out = []
+        for p in periods:
+            pset = self.pick_adaptationset(p, content_type, set_index)
+            if pset is None:
+                continue
+            try:
+                psegs, pph, pdur = self.list_segments(root, pset)
+            except StopIteration:
+                continue
+            if pph != "$Time$":
+                return segs, ph, seg_dur
+            for s in psegs:
+                if not out or s[0] > out[-1][0]:
+                    out.append(s)
+            seg_dur = pdur
+        return (out, ph, seg_dur) if out else (segs, ph, seg_dur)
 
     def _get_segment(self, url, ct, k, ph):
         # Fetch one media segment. A 404 is usually a publish race (in the
@@ -566,7 +597,8 @@ class Fetcher:
                         rep = self.pick_representation(aset, want_highest)
                         init_q, media_q = self.template(aset, rep)
                         self.log(f"{content_type}: session refreshed; continuing from last_key")
-                    segs, ph, seg_dur = self.list_segments(root, aset)
+                    segs, ph, seg_dur = self.list_track_segments(root, aset, content_type,
+                                                                 set_index)
                 except Exception as e:
                     self.log(f"{content_type}: manifest refresh failed: {e}")
                     if self._stop.wait(seg_dur):
@@ -613,13 +645,23 @@ class Fetcher:
             ref = vset if vset is not None else self.pick_adaptationset(root, "audio")
             if ref is None:
                 return None, None, None
-            segs, _ph, _sd = self.list_segments(root, ref)
+            segs, _ph, seg_dur = self.list_segments(root, ref)
             usable = segs[: len(segs) - self.behind] if self.behind else segs
             if not usable:
                 return None, None, None
             idx = max(0, len(usable) - 1 - self.prebuffer)
             if idx == 0 and len(usable) >= 2:
                 idx = 1  # keep one segment of back-margin (roll-off / startup slide)
+            # Never start further back than timeShiftBufferDepth allows. A manifest
+            # can list more than that (redcdn keeps a whole DAI ad Period listed),
+            # and a consumer that reads in real time (tvheadend paces a pipe by its
+            # PCR) holds us this far behind the edge for the life of the tune: once
+            # the list shrinks back to the window, every segment we want has already
+            # rolled off — a forward DTS jump each cycle, forever.
+            tsbd = parse_duration(root.attrib.get("timeShiftBufferDepth"), 0.0)
+            if tsbd > 0 and seg_dur > 0:
+                max_back = max(1, int(tsbd / seg_dur) - self.behind - 2)
+                idx = max(idx, len(usable) - 1 - max_back)
             start_sec = usable[idx][1]
             self.log("startup snapshot: start=%.3fs (prebuffer=%d behind=%d usable=%d)"
                      % (start_sec, self.prebuffer, self.behind, len(usable)))
