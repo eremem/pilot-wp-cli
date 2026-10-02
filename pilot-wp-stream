@@ -193,6 +193,10 @@ slate() {  # slate MESSAGE — emit slate to stdout (blocks until pipe closes).
     emit_slate "$(printf '%b' "$1")" "$logo_url" "${channel_name:-$ch_name}"
 }
 
+net_slate() {  # Pilot WP / its CDN unreachable — a network problem, not DRM or auth.
+    slate "${PILOT_WP_SLATE_TEXT_NET:-Brak połączenia z Pilot WP - sprawdź połączenie internetowe\nCannot reach Pilot WP - check the internet connection}"
+}
+
 # stream_dash KEY — restream dash_url through the in-order pilot-wp-dashlive →
 # ffmpeg pipeline with the heartbeat + detached releaser; never returns (exits with
 # ffmpeg's status). KEY is the Widevine content key, or empty for a clear channel.
@@ -233,7 +237,9 @@ stream_dash() {
     exit "$rc"
 }
 
+unreachable=0   # 1 when this attempt failed because Pilot WP couldn't be reached
 for attempt in $(seq 1 "$retries"); do
+    unreachable=0
     # Optimistic auth: on the first attempt with a non-empty jar, skip the
     # /api/v2/user pre-flight and let the channel open be the auth check (saves a
     # round-trip). resolve_auth runs only when the jar is missing/empty or on a
@@ -243,9 +249,21 @@ for attempt in $(seq 1 "$retries"); do
     # user can't read, or expired cookies and no creds. It runs in a subshell so
     # that exit shows an auth slate instead of killing the tune with "no data"
     # (its jar writes land on disk, so the subshell loses no state).
+    #
+    # An unreachable API is not an auth failure: resolve_auth would read it as a
+    # stale jar and show the auth slate during a network outage. Probe first and
+    # retry on transport failure (connection slate once retries run out).
     if [[ $attempt -gt 1 || ! -s "$PILOT_WP_COOKIES" ]]; then
         trace "resolving auth (attempt $attempt/$retries)"
-        if ! ( resolve_auth ); then
+        auth=0
+        cookies_authorize || auth=$?
+        if (( auth == 2 )); then
+            trace "API unreachable (attempt $attempt/$retries) — retrying"
+            unreachable=1
+            sleep 2
+            continue
+        fi
+        if (( auth != 0 )) && ! ( resolve_auth ); then
             trace "auth FAILED (cookie jar/creds unusable); showing auth slate"
             slate "${PILOT_WP_SLATE_TEXT_AUTH:-Błąd uwierzytelnienia - sprawdź sesję / uprawnienia\nAuthentication failed - check the session cookies / file permissions}"
             exit 0
@@ -328,15 +346,32 @@ for attempt in $(seq 1 "$retries"); do
                 # CENC DASH via stream_dash. pilot-wp-getkeys reads the KID from
                 # the MPD itself, then exchanges it at the Widevine license URL.
                 trace "DRM channel; playback enabled — fetching Widevine key"
-                key=""
+                key="" krc=0
                 if [[ -n "$dash_url" && -n "$widevine_url" ]]; then
-                    key=$("$_self_dir/pilot-wp-getkeys" "$widevine_url" "$dash_url" \
-                            2>>"${PILOT_WP_DRM_KEY_LOG:-/dev/null}") || key=""
+                    # getkeys exit 4 = MPD or license server unreachable: a network
+                    # blip, so try once more before giving up.
+                    for ki in 1 2; do
+                        krc=0
+                        key=$("$_self_dir/pilot-wp-getkeys" "$widevine_url" "$dash_url" \
+                                2>>"${PILOT_WP_DRM_KEY_LOG:-/dev/null}") || { krc=$?; key=""; }
+                        [[ -z "$key" && $krc -eq 4 && $ki -eq 1 ]] || break
+                        trace "DRM key fetch: server unreachable; retrying"
+                        sleep 2
+                    done
+                fi
+                if [[ -z "$key" && $krc -eq 4 ]]; then
+                    # The network is down, not the DRM: show the connection slate.
+                    # Release in the background — with the link down it can take
+                    # until curl's connect timeout, and the slate shouldn't wait.
+                    trace "DRM key fetch failed: server unreachable; showing connection slate"
+                    [[ -n "$token" ]] && { release_stream "$channel_id" "$token" >/dev/null 2>&1 & }
+                    net_slate
+                    exit 0
                 fi
                 if [[ -z "$key" ]]; then
                     # Key fetch failed (expired .wvd, license rejected, no dash/KID):
                     # release the slot and show the slate, as the disabled path does.
-                    trace "DRM key fetch failed; releasing session, showing DRM slate"
+                    trace "DRM key fetch failed (getkeys exit $krc); releasing session, showing DRM slate"
                     [[ -n "$token" ]] && release_stream "$channel_id" "$token" >/dev/null 2>&1 || true
                     slate "${PILOT_WP_SLATE_TEXT_DRM:-Audycja nie może być wyświetlona - kanał chroniony przez DRM\nThe program cannot be displayed - the channel is protected by DRM}"
                     exit 0
@@ -371,12 +406,17 @@ for attempt in $(seq 1 "$retries"); do
             case $auth in
                 0) trace "open failed (attempt $attempt/$retries); session valid (transient/per-channel) — retrying" ;;
                 1) trace "open failed (attempt $attempt/$retries); session rejected — retrying (jar preserved)" ;;
-                2) trace "open failed (attempt $attempt/$retries); API unreachable — retrying" ;;
+                2) trace "open failed (attempt $attempt/$retries); API unreachable — retrying"; unreachable=1 ;;
             esac
             sleep 1
             ;;
     esac
 done
 
+if (( unreachable )); then
+    trace "giving up after $retries attempts: API unreachable; showing connection slate"
+    net_slate
+    exit 0
+fi
 trace "giving up after $retries attempts"
 exit 5

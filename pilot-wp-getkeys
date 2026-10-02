@@ -16,6 +16,13 @@
 # The pilot.wp.pl session cookies come from the cookie jar and are sent only to
 # the license server, never to the MPD CDN.
 #
+# Exit codes (no key on stdout unless 0):
+#   1 = .wvd unreadable          2 = no KID in the MPD (or unparseable)
+#   3 = CDM/challenge error      4 = MPD or license server unreachable (connection
+#                                    error, timeout or HTTP 5xx): a network problem
+#   5 = license refused (4xx)    6 = license unparseable   7 = no content key
+# pilot-wp-stream shows the connection slate on 4 and the DRM slate otherwise.
+#
 # This is the pywidevine half of the DRM path: pilot-wp-stream's drm) branch calls
 # it and passes the key to run_dash_pipeline, where ffmpeg's mov demuxer decrypts
 # the in-order fragments from pilot-wp-dashlive via -decryption_key.
@@ -62,10 +69,15 @@ def kid_from_mpd(url):
     # Fetch the DASH manifest (UA only, no cookie) and return the first
     # cenc:default_KID (compact lowercase hex), or "" if none.
     try:
-        raw = requests.get(url, headers={"User-Agent": ua}, verify=False, timeout=20).content
-        root = ET.fromstring(raw)
+        r = requests.get(url, headers={"User-Agent": ua}, verify=False, timeout=20)
+    except requests.RequestException as e:
+        die("MPD unreachable: %s: %s" % (type(e).__name__, e), 4)
+    if r.status_code >= 500:
+        die("MPD fetch: HTTP %s" % r.status_code, 4)
+    try:
+        root = ET.fromstring(r.content)
     except Exception as e:
-        die("could not fetch/parse MPD for KID: %s: %s" % (type(e).__name__, e), 2)
+        die("could not parse MPD for KID (HTTP %s): %s: %s" % (r.status_code, type(e).__name__, e), 2)
     L = lambda t: t.rsplit("}", 1)[-1]
     for cp in (e for e in root.iter() if L(e.tag) == "ContentProtection"):
         for k, v in cp.attrib.items():
@@ -93,8 +105,10 @@ except Exception as e:
 try:
     r = requests.post(wv_url, data=challenge, headers=hdrs, verify=False, timeout=25)
 except Exception as e:
-    die("license POST failed: %s: %s" % (type(e).__name__, e), 4)
+    die("license server unreachable: %s: %s" % (type(e).__name__, e), 4)
 
+if r.status_code >= 500:
+    die("license server HTTP %s" % r.status_code, 4)
 if r.status_code != 200 or not r.content:
     die("license server HTTP %s (%d bytes)" % (r.status_code, len(r.content)), 5)
 

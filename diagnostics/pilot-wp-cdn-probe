@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pilot-wp-cdn-probe [--dash|--hls] [--wait SECS] CHANNEL_ID [N_SEGS]
+# pilot-wp-cdn-probe [--dash|--hls] [--wait SECS] [--live SECS] CHANNEL_ID [N_SEGS]
 #
 # Diagnostic for a channel that stutters (DTS discontinuities, segments fetched
 # slower than real time). It answers: can THIS box pull the channel's segments
@@ -39,17 +39,28 @@
 # lists fewer than N_SEGS pairs. The probe then re-reads the manifest and times
 # segments as they are published — video and audio in the same rounds, as
 # pilot-wp-dashlive fetches them — until it has N_SEGS per mode or --wait SECS
-# (default 90, 0 = off) runs out. Deps: the suite's own (curl, jq) plus python3
-# stdlib.
+# (default 90, 0 = off) runs out.
+#
+# Those timings are a burst of a few seconds: they measure throughput, but an
+# unstable link (a modem dropping out for seconds at a time) sails through them
+# while playback stalls. So the probe then watches the link for --live SECS
+# (default 60, 0 = off), polling like pilot-wp-dashlive in steady state: the
+# manifest once per segment duration (through the CDN's redirector), every newly
+# published segment on the keep-alive connection, and the Pilot WP API every 10 s
+# (heartbeats and a re-tune's key fetch need it). Failures, slow fetches and gaps
+# with no new segment are printed as they happen and feed the VERDICT. Deps: the
+# suite's own (curl, jq) plus python3 stdlib.
 set -euo pipefail
 
-usage="usage: pilot-wp-cdn-probe [--dash|--hls] [--wait SECS] CHANNEL_ID [N_SEGS]"
-force="" wait=90 args=()
+usage="usage: pilot-wp-cdn-probe [--dash|--hls] [--wait SECS] [--live SECS] CHANNEL_ID [N_SEGS]"
+force="" wait=90 live=60 args=()
 while (( $# )); do
     case "$1" in
         --dash|--hls) force=${1#--} ;;
         --wait)       [[ $# -ge 2 ]] || { echo "$usage" >&2; exit 2; }; wait=$2; shift ;;
         --wait=*)     wait=${1#*=} ;;
+        --live)       [[ $# -ge 2 ]] || { echo "$usage" >&2; exit 2; }; live=$2; shift ;;
+        --live=*)     live=${1#*=} ;;
         -h|--help)    echo "$usage"; exit 0 ;;
         -*)           echo "pilot-wp-cdn-probe: unknown option $1" >&2; echo "$usage" >&2; exit 2 ;;
         *)            args+=("$1") ;;
@@ -61,6 +72,7 @@ nseg="${args[1]:-8}"
 [[ -n "$channel_id" ]] || { echo "$usage" >&2; exit 2; }
 [[ "$nseg" =~ ^[1-9][0-9]*$ ]] || { echo "pilot-wp-cdn-probe: N_SEGS must be a positive integer" >&2; exit 2; }
 [[ "$wait" =~ ^[0-9]+$ ]] || { echo "pilot-wp-cdn-probe: --wait takes whole seconds (0 = don't wait)" >&2; exit 2; }
+[[ "$live" =~ ^[0-9]+$ ]] || { echo "pilot-wp-cdn-probe: --live takes whole seconds (0 = off)" >&2; exit 2; }
 
 _self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
 # shellcheck source=pilot-wp-common.sh
@@ -125,7 +137,9 @@ if [[ "$path" == dash ]]; then url=$dash_url; else url=$hls_url; fi
 # and keep it alive with heartbeats (the run is well inside the ~3 min before
 # pilot-wp-stream would need a session switch). Token-less (redcdn) URLs outlive
 # the session: free the slot at once.
+gated=0
 if is_token_gated "$url"; then
+    gated=1
     slot="held for the run (token-gated URL), released on exit"
     if [[ -n "$hb_url" ]]; then
         [[ "$hb_interval" =~ ^[0-9]+$ ]] || hb_interval=20
@@ -156,14 +170,19 @@ if (( wait > 0 )); then
 else
     echo "            from the newest published ones (--wait 0: only those already listed)"
 fi
+if (( live > 0 )); then
+    echo "  live:     then ${live}s polling like pilot-wp-dashlive, to catch an unstable link (--live 0: off)"
+fi
 echo
 
-"$PY" - "$path" "$url" "$PILOT_WP_UA" "$nseg" "$wait" <<'PY'
+"$PY" - "$path" "$url" "$PILOT_WP_UA" "$nseg" "$wait" "$live" "$gated" "$USER_URL" <<'PY'
 import sys, re, time, ssl, http.client, urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
+T_START = time.monotonic()
 mode, url, ua, nseg, wait = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4] or "8"), int(sys.argv[5] or "90")
+live_secs, gated, api_url = int(sys.argv[6] or "0"), sys.argv[7] == "1", sys.argv[8]
 ln  = lambda t: t.rsplit("}", 1)[-1]
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 
@@ -472,6 +491,162 @@ def run_hls():
         return {label: media_playlist(pu)[0] for label, _, pu in specs}
     return tracks, refresh, node
 
+# ---- live stability (--live) ---------------------------------------------------
+API_EVERY = 10   # seconds between Pilot WP API checks
+
+class Stat:
+    # One component of the live run (the manifest, a track, the API): counts and
+    # timings, its problems printed as they happen. A fetch slower than `budget`
+    # seconds is flagged.
+    def __init__(s, name, budget):
+        s.name, s.budget = name, budget
+        s.n = s.fail = s.slow = 0; s.tot = s.max = s.gap = 0.0
+
+    def add(s, at, dt, err=None, what=""):
+        s.n += 1
+        if err:
+            s.fail += 1
+            print(f"   [{at:6.1f}s] {s.name}{what}: FAILED after {dt*1000:.0f}ms - {err}", flush=True)
+            return
+        s.tot += dt; s.max = max(s.max, dt)
+        if dt > s.budget:
+            s.slow += 1
+            print(f"   [{at:6.1f}s] {s.name}{what}: {dt*1000:.0f}ms (over the {s.budget*1000:.0f}ms budget)",
+                  flush=True)
+
+    def line(s, extra=""):
+        ok = s.n - s.fail
+        avg = f"avg {s.tot/ok*1000:.0f}ms, max {s.max*1000:.0f}ms" if ok else "none succeeded"
+        print(f"   {s.name:12s} {s.n:3d} fetches, {s.fail} failed, {s.slow} slow; {avg}{extra}")
+
+def live_seg(t, u):
+    # One segment on the track's keep-alive connection, as pilot-wp-dashlive fetches
+    # it. Returns (seconds, error or None); a dropped connection is reopened.
+    h, path = split_url(u)
+    if h != t.host:
+        if t.conn: t.conn.close()
+        t.host, t.conn = h, new_conn(h)
+    t0 = time.monotonic()
+    try:
+        t.conn.request("GET", path, headers={"User-Agent": ua})
+        r = t.conn.getresponse(); r.read()
+    except Exception as e:
+        try: t.conn.close()
+        except Exception: pass
+        t.conn = new_conn(t.host)
+        return time.monotonic() - t0, f"{type(e).__name__}: {e} (connection dropped)"
+    return time.monotonic() - t0, (None if r.status == 200 else f"HTTP {r.status}")
+
+def api_check():
+    # Any HTTP answer means the API is reachable. No cookie is sent: an anonymous
+    # /api/v2/user just returns data:null and touches no session.
+    t0 = time.monotonic()
+    try:
+        get(api_url)
+    except urllib.error.HTTPError:
+        pass
+    except Exception as e:
+        return time.monotonic() - t0, f"{type(e).__name__}: {e}"
+    return time.monotonic() - t0, None
+
+def live(tracks, refresh):
+    # pilot-wp-dashlive's steady state for live_secs: the manifest once per segment
+    # duration, each newly published segment of every track, and the API every
+    # API_EVERY s. A track's gap is the time between two of its segments arriving;
+    # beyond 3 segment durations playback has used up its slack and stalls.
+    secs = live_secs
+    if gated:
+        # Videostar tokens are revoked a few minutes into a session: stay inside
+        # that, or the run ends in 403s that are not the link's fault.
+        secs = min(secs, max(0, int(150 - (time.monotonic() - T_START))))
+        if secs < live_secs:
+            print(f"LIVE  shortened to {secs}s: the token-gated URL expires a few minutes into the session")
+    if secs <= 0:
+        return None
+    cad = min(t.seg_dur for t in tracks)
+    print(f"LIVE  {secs}s polling like pilot-wp-dashlive: manifest every {cad:.1f}s, new segments on one "
+          f"keep-alive connection per track, Pilot WP API every {API_EVERY}s. Problems as they happen:",
+          flush=True)
+    man = Stat("manifest", cad)
+    api = Stat("Pilot WP API", 5.0)
+    st = {t.label: Stat(t.label, t.seg_dur) for t in tracks}
+    for t in tracks:            # report() closed the burst connections
+        t.host = t.conn = None
+    t0 = time.monotonic()
+    last_ok = {t.label: t0 for t in tracks}
+    next_api = t0
+    try:
+        while time.monotonic() - t0 < secs:
+            cs = time.monotonic()
+            if api_url and cs >= next_api:
+                next_api = cs + API_EVERY
+                dt, err = api_check(); api.add(cs - t0, dt, err)
+            rs = time.monotonic()
+            try:
+                lists = refresh()
+                man.add(rs - t0, time.monotonic() - rs)
+            except Exception as e:
+                man.add(rs - t0, time.monotonic() - rs, f"{type(e).__name__}: {e}")
+                lists = {}
+            for t in tracks:
+                for k, u in [s for s in lists.get(t.label, []) if t.last is None or s[0] > t.last]:
+                    if time.monotonic() - t0 >= secs:
+                        break
+                    at = time.monotonic() - t0
+                    dt, err = live_seg(t, u); t.last = k
+                    st[t.label].add(at, dt, err, f" seg {k}")
+                    if not err:
+                        now = time.monotonic()
+                        st[t.label].gap = max(st[t.label].gap, now - last_ok[t.label])
+                        last_ok[t.label] = now
+            rest = cad - (time.monotonic() - cs)
+            if rest > 0:
+                time.sleep(rest)
+    except KeyboardInterrupt:
+        print("   (interrupted)")
+    end = time.monotonic()
+    for t in tracks:
+        st[t.label].gap = max(st[t.label].gap, end - last_ok[t.label])
+        if t.conn: t.conn.close()
+    print(f"   --- after {end - t0:.0f}s:")
+    man.line()
+    for t in tracks:
+        st[t.label].line(f"; longest gap between segments {st[t.label].gap:.1f}s "
+                         f"(stalls beyond {3*t.seg_dur:.0f}s)")
+    if api_url:
+        api.line()
+    print()
+    return dict(secs=end - t0, man=man, api=api if api_url else None,
+                tracks=[(st[t.label], t.seg_dur) for t in tracks])
+
+def live_verdict(L):
+    if L is None:
+        return
+    man, api = L["man"], L["api"]
+    bad = []
+    if man.fail:
+        bad.append(f"{man.fail}/{man.n} manifest refreshes failed")
+    for s, sd in L["tracks"]:
+        if s.fail:
+            bad.append(f"{s.fail}/{s.n} {s.name} segments failed")
+        if s.gap > 3 * sd:
+            bad.append(f"{s.name} went {s.gap:.0f}s without a new segment")
+    if api and api.fail:
+        bad.append(f"{api.fail}/{api.n} Pilot WP API checks failed")
+    slow = ([f"manifest up to {man.max*1000:.0f}ms"] if man.slow else []) \
+         + [f"{s.name} up to {s.max*1000:.0f}ms" for s, _ in L["tracks"] if s.slow] \
+         + ([f"Pilot WP API up to {api.max*1000:.0f}ms"] if api and api.slow else [])
+    if bad:
+        print(f"  LIVE: the link is UNSTABLE - over {L['secs']:.0f}s: " + "; ".join(bad) + ".")
+        print("          Playback stalls and stops like this, and a re-tune can't reach the server (the "
+              "connection slate). The burst timings above can't show it: they last a few seconds. "
+              "Check the modem/line (resyncs, errors) and re-run with a longer --live.")
+    elif slow:
+        print(f"  LIVE: no failures over {L['secs']:.0f}s, but slow fetches (" + ", ".join(slow) + ") - "
+              f"the link stalls at times; playback rides that out only while its buffer lasts.")
+    else:
+        print(f"  LIVE: stable for {L['secs']:.0f}s - no failures, no slow fetches, no gaps.")
+
 try:
     tracks, refresh, node = run_dash() if mode == "dash" else run_hls()
 except urllib.error.HTTPError as e:
@@ -487,6 +662,7 @@ try:
 except KeyboardInterrupt:
     sys.exit(130)
 res = [t.report() for t in tracks]
+L = live(tracks, refresh) if live_secs > 0 and tracks else None
 
 # ---- verdict -----------------------------------------------------------------
 print("VERDICT")
@@ -532,4 +708,5 @@ for r in res:
         else:
             print(f"          -> a bitrate cap won't fix latency; this is the link/path (compare against a "
                   f"healthy box or run from elsewhere).")
+live_verdict(L)
 PY

@@ -110,7 +110,7 @@ When the session goes stale, log in again (`./pilot-wp-login --web` or `./pilot-
 | `DEVICE_TYPE` | `android_tv` | `device_type` query parameter sent on every API call. |
 | `PILOT_WP_UA` | `ExoMedia 4.3.0 (43000) / Android 8.0.0 / foster_e` | Advanced: User-Agent sent to the API and CDN, impersonating the Android TV app. Change only if Pilot WP starts rejecting this identity; a wrong value breaks auth and streaming. |
 | `PILOT_WP_X_VERSION` | `pl.videostar\|3.53.0-gms\|Android\|26\|foster_e` | Advanced: the `X-Version` header, the other half of the Android TV app identity. Same caveat as `PILOT_WP_UA`. |
-| `PILOT_WP_RETRIES` | `3` | Per-tune attempts in `pilot-wp-stream` before giving up (exit 5). |
+| `PILOT_WP_RETRIES` | `3` | Per-tune attempts in `pilot-wp-stream` before giving up (exit 5, or the connection slate when Pilot WP was unreachable). |
 | `PILOT_WP_LIMIT_RETRIES` | `3` | Open attempts on the concurrent-stream (multiroom) limit before showing the limit slate. |
 | `PILOT_WP_LIMIT_DELAY` | `2` | Seconds between those attempts. |
 | `PILOT_WP_M3U_DRM_SCAN` | `1` | `pilot-wp-m3u` probes channels (releasing each session) to add a `DRM` tvh-tag — the channel list has no DRM flag. Results are cached and only unknown/expired channels are probed. `0` = no probing, no cache, no DRM tag. |
@@ -127,10 +127,10 @@ When the session goes stale, log in again (`./pilot-wp-login --web` or `./pilot-
 | `PILOT_WP_DASH_FFMPEG_FLAGS` | `-loglevel fatal -copyts` | ffmpeg flags for every DASH tune (it reads the dashlive FIFOs, decrypting when there is a key). Keep `-copyts`: without it audio desyncs on `$Number$`-based channels. Don't add HLS/network flags (`-live_start_index`, `-reconnect_at_eof`, a large `-probesize`) — they break FIFO input. |
 | `PILOT_WP_REFRESH_INTERVAL` | `100` | Seconds between session refreshes on token-gated DASH URLs (`t2`/`t3`/`ts` query tokens, e.g. TV Puls, Puls 2), whose segment access is revoked a few minutes into play. The session is switched in place and the new URL handed to the running `pilot-wp-dashlive`; sustained 403s trigger an immediate refresh. |
 | `PILOT_WP_HLS_FFMPEG_FLAGS` | `-loglevel fatal -probesize 15M -analyzeduration 6000000 -live_start_index -1 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5` | ffmpeg input flags for the HLS fallback. The analysis window must cover the audio-description rendition, which arrives ~4 s after the main audio, or the tune misses that track. `-live_start_index -1` starts at the live edge; drop it if a channel underruns. |
-| `PILOT_WP_SLATE_LOGO` | empty | Local image used as the logo on every slate (DRM, stream limit, auth failure) instead of the channel logo; the message is still drawn. |
+| `PILOT_WP_SLATE_LOGO` | empty | Local image used as the logo on every slate (DRM, stream limit, auth failure, no connection) instead of the channel logo; the message is still drawn. |
 | `PILOT_WP_SLATE_FONT` | `/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf` | Slate font. |
 | `PILOT_WP_SLATE_BG` / `_SIZE` / `_FONTSIZE` / `_TITLE_FONTSIZE` / `_TOP` / `_GAP` | `0x101820` / `1280x720` / `32` / `56` / `60` / `90` | Slate colour, resolution, text sizes, layout. |
-| `PILOT_WP_SLATE_TEXT_DRM` / `_LIMIT` / `_AUTH` | bilingual (Polish + English) | Slate messages (`\n` for line breaks). |
+| `PILOT_WP_SLATE_TEXT_DRM` / `_LIMIT` / `_AUTH` / `_NET` | bilingual (Polish + English) | Slate messages (`\n` for line breaks). `_NET` is shown when Pilot WP or its CDN can't be reached. |
 | `PILOT_WP_TRACE` | `0` | `1` = per-step trace lines on stderr (see [Tracing](#tracing)). |
 | `PILOT_WP_RELEASE_LOG` | empty | File the detached slot releaser appends to (see [Tracing](#tracing)). |
 | `PILOT_WP_PING_TIMEOUT` | `15` | `pilot-wp-ping`: seconds for its probe request. |
@@ -163,8 +163,8 @@ The tools:
 | `pilot-wp-sessions [list\|remove …]` | Anytime | Lists and removes the account's login sessions; see [Managing sessions](#managing-sessions). |
 | `pilot-wp-favourites [list\|add\|remove …]` | Anytime | Lists and edits favourite channels; see [Managing favourites](#managing-favourites). |
 | `pilot-wp-m3u [--rescan] OUTPUT_PATH` | After login, and again when the channel lineup changes (cron optional — see [Daily channel-list refresh](#daily-channel-list-refresh-cron)) | Writes a tvheadend M3U whose entries are `pipe://` invocations of `pilot-wp-stream`; `--rescan` re-probes every channel's DRM status, ignoring the cache. No stream URLs are embedded, so it doesn't go stale when tokens expire. |
-| `pilot-wp-stream CHANNEL_ID ['NAME'] ['THUMB_URL'] [AUDIO_ONLY]` | Invoked by tvheadend per tune | Opens the channel, heartbeats it, and writes MPEG-TS to stdout; DRM (when not enabled) and over-limit channels get a slate. |
-| `diagnostics/pilot-wp-cdn-probe [--dash\|--hls] [--wait SECS] CHANNEL_ID [N_SEGS]` | When a channel stutters | Measures whether this box can fetch the channel's segments fast enough; see [Diagnosing a stutter](#diagnosing-a-stutter). Not used during playback. |
+| `pilot-wp-stream CHANNEL_ID ['NAME'] ['THUMB_URL'] [AUDIO_ONLY]` | Invoked by tvheadend per tune | Opens the channel, heartbeats it, and writes MPEG-TS to stdout; DRM (when not enabled) and over-limit channels get a slate, and so does a tune that can't reach Pilot WP. |
+| `diagnostics/pilot-wp-cdn-probe [--dash\|--hls] [--wait SECS] [--live SECS] CHANNEL_ID [N_SEGS]` | When a channel stutters or stops | Measures whether this box can fetch the channel's segments fast enough, and whether the link stays up; see [Diagnosing a stutter](#diagnosing-a-stutter). Not used during playback. |
 | `pilot-wp-common.sh` | Sourced by the others | Library; not directly runnable. |
 
 ### Generating the M3U
@@ -280,9 +280,9 @@ Every 6–12 h is plenty. Run the cron as the user that owns `cookies.txt` (the 
 **Per tune** (`pilot-wp-stream`): `fetch_channel` does `GET /api/v3/channel/{id}` and returns one of:
 
 - **ok** — start the heartbeat (`POST .data.heartbeat.url` every `.data.heartbeat.interval` s; without it the session is reaped within ~20–40 s), then stream the clear DASH through `pilot-wp-dashlive` → ffmpeg (HLS straight into ffmpeg as the fallback — see `PILOT_WP_FTA_DASH`). All audio tracks are mapped so Kodi can switch between them.
-- **drm** — `.data.stream_channel.drms` is set and the manifest really is encrypted (it is checked; see `PILOT_WP_DRM_VERIFY_TIMEOUT`). With DRM playback enabled, the same DASH pipeline runs with a Widevine key from `pilot-wp-getkeys`; otherwise, or if the key fetch fails, the session is released and a slate shown. See [DRM playback](#drm-playback-optional).
+- **drm** — `.data.stream_channel.drms` is set and the manifest really is encrypted (it is checked; see `PILOT_WP_DRM_VERIFY_TIMEOUT`). With DRM playback enabled, the same DASH pipeline runs with a Widevine key from `pilot-wp-getkeys`; otherwise, or if the key fetch fails, the session is released and a slate shown — the connection slate when the manifest or license server couldn't be reached (after one retry), else the DRM slate. See [DRM playback](#drm-playback-optional).
 - **limit** — `multiroom_limit_exceeded`: the concurrent-stream cap is hit. Retried `PILOT_WP_LIMIT_RETRIES` times (a just-ended tune may still be clearing), then a slate.
-- **error** — retried. The cookie jar is never wiped (it is the only credential and is shared by every tune).
+- **error** — retried. The cookie jar is never wiped (it is the only credential and is shared by every tune). If the API was unreachable on the last attempt, the tune ends on the connection slate; an unreachable API is never taken for a stale jar (no auth slate).
 
 On DASH tunes whose URL carries `t2`/`t3`/`ts` tokens, the heartbeat loop also refreshes the session every `PILOT_WP_REFRESH_INTERVAL` s and hands the new URL to the running `pilot-wp-dashlive`.
 
@@ -302,7 +302,7 @@ Endpoints and headers are constants at the top of `pilot-wp-common.sh`; if Pilot
 | `2` | `resolve_auth` | Jar invalid/expired and no TTY to refresh it (and no working creds). Usually: tvheadend invoked the script and `cookies.txt` is missing/stale/unreadable — run `pilot-wp-login`. |
 | `3` | `resolve_auth` | Supplied credentials/cookies rejected by the API. Re-run `pilot-wp-login` with fresh cookies. |
 | `4` | `pilot-wp-account-info` / `pilot-wp-m3u` | Not authenticated / channel list not an array — cookies bad or expired. |
-| `5` | `pilot-wp-stream` | All `PILOT_WP_RETRIES` attempts failed. Check stderr. |
+| `5` | `pilot-wp-stream` | All `PILOT_WP_RETRIES` attempts failed with Pilot WP reachable (an unreachable one gets the connection slate instead). Check stderr. |
 | `1` | `pilot-wp-status` | At least one FAIL item needs attention before streaming. |
 | `1` | `pilot-wp-ping` | Session dead: jar missing/empty, or the API rejected it. Run `pilot-wp-login`. |
 | `2` | `pilot-wp-ping` | Transport failure: API unreachable / timed out / jar lock busy. The next run retries. |
@@ -311,6 +311,7 @@ Endpoints and headers are constants at the top of `pilot-wp-common.sh`; if Pilot
 
 - **An "authentication failed" slate appears** — `pilot-wp-stream` couldn't use the cookie jar: it's missing or expired, or (the usual tvheadend case) `cookies.txt` is owned by another user and tvheadend's user can't read it. Make the jar and `config.env` readable by the tvheadend user — ideally run `pilot-wp-login` as that user. Running `./pilot-wp-stream <id> </dev/null` as that user prints the `resolve_auth:` reason on stderr.
 - **`exit 3` right after login** — the pasted cookies are wrong or expired. Log in again in the browser, re-paste, and confirm with `./pilot-wp-account-info`.
+- **A channel plays briefly, stutters, stops, then shows the connection slate** ("Brak połączenia z Pilot WP") — the internet link dropped: playback ran on its buffer, and the re-tune couldn't reach Pilot WP. Check the modem/line; `diagnostics/pilot-wp-cdn-probe` with a longer `--live` catches a link that drops out now and then (see [Diagnosing a stutter](#diagnosing-a-stutter)).
 - **A channel shows the DRM slate** — the channel is Widevine-encrypted and DRM playback is off; see [DRM playback](#drm-playback-optional). If it's enabled and you still get the slate, set `PILOT_WP_DRM_KEY_LOG` and `PILOT_WP_TRACE=1` and check the `pilot-wp-getkeys` output (expired `.wvd`, license rejected, or `PILOT_WP_PYTHON` can't import pywidevine). `./pilot-wp-status` checks the DRM prerequisites.
 - **A channel shows the stream-limit slate** — the account's concurrent-stream cap is reached. Stop another stream or device; a stopped tune frees its slot within seconds, an abandoned one within ~20–40 s.
 - **tvheadend says "no available adapters" / sessions pile up while zapping** — slots aren't being released on teardown (see [How it works](#how-it-works)). Check that `setsid` exists (`command -v setsid`; without it slots only self-expire after ~20–40 s), set `PILOT_WP_RELEASE_LOG` and look for `release: ok` after each stop, and remember that a browser session on the same account also holds a slot. To clear leftover processes: `pkill -9 -f pilot-wp-stream; pkill -9 -f pilot-wp-dashlive; pkill -9 -f 'pilot-wp-drm-|videostar|color=c='`, and restart tvheadend if its subscription count stays stale.
@@ -345,6 +346,8 @@ The two modes fetch different, alternate segments, interleaved in time, so neith
 - **Both slow** — the link or path to the CDN is the limit. Check the modem; if the transfer time dominates, cap the video with `--max-video-bw` in `PILOT_WP_DASHLIVE_ARGS` (the probe prints the next lower rung of the channel's quality ladder). The HLS fallback can't cap the bitrate; re-run with `--dash` to see whether the channel's DASH path would keep up.
 
 A keep-alive `RECONNECT` during the run means the connection was dropped mid-stream, which alone causes stalls. Failed fetches (HTTP errors) are counted and reported separately.
+
+Those timings come from a burst of a few seconds. They measure throughput, but a link that drops out now and then — a modem resyncing, say — passes them while playback stalls and stops. So the probe then watches the link for `--live SECS` (default 60; `--live 0` skips it), polling the way `pilot-wp-dashlive` does in steady state: the manifest once per segment duration, every newly published segment on the keep-alive connection, and the Pilot WP API every 10 s (heartbeats and a re-tune's key fetch depend on it). Failures, fetches slower than a segment duration, and gaps between segments are printed as they happen, then summed up. The `LIVE` line of the verdict says **UNSTABLE** when anything failed or a track went longer than three segment durations without a new segment, even when the throughput above was fine. If playback stops only every few minutes, raise `--live` to cover a few of those intervals. On a token-gated (videostar) channel the live run is shortened to stay within the session's few minutes.
 
 ### Tracing
 

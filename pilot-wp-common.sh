@@ -124,8 +124,11 @@ CHANNELS_CLOSE_URL="${BASE_URL}/api/v2/channels/close?device_type=${DEVICE_TYPE}
 # new cookies (pilot-wp-ping) set CALL_API_SAVE_JAR=1 under the lock.
 call_api() {
     local method=$1 url=$2 body=${3:-}
+    # --connect-timeout: with the link down, a connect would otherwise hang for
+    # curl's default 300 s, and a tune would sit on a black screen instead of
+    # reaching the connection slate.
     local args=(
-        -sS -k
+        -sS -k --connect-timeout 10
         -b "$PILOT_WP_COOKIES"
         -X "$method"
         -H "User-Agent: $PILOT_WP_UA"
@@ -147,8 +150,9 @@ call_api() {
 #   0 = authorized        (got a user object with .data.id)
 #   1 = rejected          (jar empty, or server replied with data:null / no id)
 #   2 = inconclusive      (transport-level failure: DNS, connect, TLS, timeout)
-# resolve_auth only branches on 0 vs non-zero; pilot-wp-stream's retry loop logs
-# which of the three it got, and pilot-wp-ping mirrors them as its exit codes.
+# resolve_auth only branches on 0 vs non-zero; pilot-wp-stream treats 2 as a
+# network outage (connection slate, not the auth slate), and pilot-wp-ping
+# mirrors the three as its exit codes.
 cookies_authorize() {
     [[ -s "$PILOT_WP_COOKIES" ]] || return 1
     local resp
