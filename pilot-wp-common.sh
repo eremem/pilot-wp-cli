@@ -575,6 +575,8 @@ session_refresh_loop() {
 # logo in a top band, and MESSAGE below it. TITLE (the channel name) takes the
 # logo's place only when no logo can be rendered. PILOT_WP_SLATE_LOGO (a local
 # image) overrides the downloaded LOGO_URL. Runs until the consumer closes the pipe.
+# The SDT names the service like the real stream (provider Pilot WP, TITLE), or
+# tvheadend renames the channel's service to ffmpeg's "Service01" after a slate.
 emit_slate() {
     local msg=$1 logo_url=${2:-} title=${3:-}
     local bg=${PILOT_WP_SLATE_BG:-0x101820}
@@ -646,6 +648,8 @@ emit_slate() {
         -map "[v]" -map 1:a \
         -c:v libx264 -preset ultrafast -tune stillimage -pix_fmt yuv420p -g 50 -threads 1 \
         -c:a aac -b:a 64k \
+        -metadata "service_provider=Pilot WP" \
+        ${title:+-metadata "service_name=${title}"} \
         -f mpegts -mpegts_flags +initial_discontinuity -
     local rc=$?
     [[ -n "$tmplogo" ]] && rm -f "$tmplogo"
