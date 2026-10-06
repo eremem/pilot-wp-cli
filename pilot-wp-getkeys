@@ -17,9 +17,12 @@
 # the license server, never to the MPD CDN.
 #
 # Exit codes (no key on stdout unless 0):
-#   1 = .wvd unreadable          2 = no KID in the MPD (or unparseable)
-#   3 = CDM/challenge error      4 = MPD or license server unreachable (connection
-#                                    error, timeout or HTTP 5xx): a network problem
+#   1 = .wvd unreadable          2 = no KID in the MPD
+#   3 = CDM/challenge error      4 = MPD or license server unreachable: a network
+#                                    or CDN problem. For the MPD: no answer, an
+#                                    HTTP error or a body that isn't an MPD, after
+#                                    retrying for MPD_BUDGET s; for the license
+#                                    server: connection error, timeout or HTTP 5xx
 #   5 = license refused (4xx)    6 = license unparseable   7 = no content key
 # pilot-wp-stream shows the connection slate on 4 and the DRM slate otherwise.
 #
@@ -42,7 +45,7 @@ cookie_header="$(cookies_as_header)" \
 ua="$PILOT_WP_UA" \
 x_version="$PILOT_WP_X_VERSION" \
 "$PILOT_WP_PYTHON" - "$wv_url" "$kid_or_mpd" "$PILOT_WP_WVD" <<'PY'
-import os, sys, warnings
+import os, sys, time, warnings
 warnings.filterwarnings("ignore")  # silence urllib3 InsecureRequestWarning (verify=False)
 import requests
 import xml.etree.ElementTree as ET
@@ -65,19 +68,40 @@ def die(msg, code=1):
     print("pilot-wp-getkeys: %s" % msg, file=sys.stderr)
     sys.exit(code)
 
+# Seconds to keep retrying the MPD fetch. pilot-wp-stream runs getkeys a second
+# time on exit 4, and the whole tune has to stay inside tvheadend's 60 s
+# "No input detected" window.
+MPD_BUDGET = 20
+
 def kid_from_mpd(url):
     # Fetch the DASH manifest (UA only, no cookie) and return the first
-    # cenc:default_KID (compact lowercase hex), or "" if none.
-    try:
-        r = requests.get(url, headers={"User-Agent": ua}, verify=False, timeout=20)
-    except requests.RequestException as e:
-        die("MPD unreachable: %s: %s" % (type(e).__name__, e), 4)
-    if r.status_code >= 500:
-        die("MPD fetch: HTTP %s" % r.status_code, 4)
-    try:
-        root = ET.fromstring(r.content)
-    except Exception as e:
-        die("could not parse MPD for KID (HTTP %s): %s: %s" % (r.status_code, type(e).__name__, e), 2)
+    # cenc:default_KID (compact lowercase hex), or "" if none. The URL goes through
+    # the CDN's redirector (r.dcs.redcdn.pl), which can fail on its own while the
+    # nodes behind it are fine: some of its addresses time out. So a failed fetch
+    # (no answer, an HTTP error, a body that isn't XML) is retried for MPD_BUDGET s
+    # and then reported as unreachable (exit 4, the connection slate), never as a
+    # DRM problem.
+    deadline = time.monotonic() + MPD_BUDGET
+    tries, err = 0, None
+    while True:
+        left = deadline - time.monotonic()
+        if left < 1:
+            die("MPD unreachable after %d tries: %s" % (tries, err), 4)
+        tries += 1
+        try:
+            r = requests.get(url, headers={"User-Agent": ua}, verify=False,
+                             timeout=(min(5, left), min(10, left)))
+            if r.status_code >= 400:
+                err = "HTTP %s" % r.status_code
+            else:
+                root = ET.fromstring(r.content)
+                break
+        except requests.RequestException as e:
+            err = "%s: %s" % (type(e).__name__, e)
+        except ET.ParseError as e:
+            err = "not an MPD (HTTP %s, %d bytes): %s" % (r.status_code, len(r.content), e)
+        print("pilot-wp-getkeys: MPD fetch try %d failed: %s" % (tries, err), file=sys.stderr)
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
     L = lambda t: t.rsplit("}", 1)[-1]
     for cp in (e for e in root.iter() if L(e.tag) == "ContentProtection"):
         for k, v in cp.attrib.items():

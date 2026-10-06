@@ -26,7 +26,7 @@
 # It stays --behind segments back from the live edge: the newest segment a
 # dynamic manifest advertises is often not fully written yet, and fetching it
 # yields a short/garbled read (h264 decode errors downstream).
-import argparse, os, queue, re, signal, sys, threading, time, urllib.request, urllib.error
+import argparse, os, queue, re, signal, sys, threading, time, urllib.request, urllib.error, urllib.parse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -93,6 +93,11 @@ class Fetcher:
         self._403_streak = 0
         self._last_signal = -1e9
         self._stop = threading.Event()
+        # Manifest node pinning (see _get_mpd): the redirector's answer for the
+        # current mpd_url, shared by the track workers. node_ttl 0 = off.
+        self.node_ttl = max(0.0, getattr(args, "node_ttl", 300.0) or 0.0)
+        self._node_lock = threading.Lock()
+        self._node = None   # {"src": mpd_url, "url": node MPD url, "until": monotonic}
         self.verbose = False
         self.log_tracks = False
         self._t0 = time.monotonic()
@@ -167,18 +172,23 @@ class Fetcher:
         return s
 
     def http_get(self, url):
-        # GET url and return the body bytes, over a warm keep-alive connection
-        # when requests is available, else a one-shot urllib request. An HTTP
-        # >=400 is surfaced as urllib's HTTPError so callers catch one type for
-        # both backends. With requests, a connection/timeout error is retried once
-        # on a fresh connection before propagating.
+        # GET url and return the body bytes (see _get).
+        return self._get(url)[0]
+
+    def _get(self, url, connect_timeout=None, timeout=None, attempts=2):
+        # GET url and return (body bytes, final URL after redirects), over a warm
+        # keep-alive connection when requests is available, else a one-shot urllib
+        # request. An HTTP >=400 is surfaced as urllib's HTTPError so callers catch
+        # one type for both backends. With requests, a connection/timeout error is
+        # retried on a fresh connection (`attempts` tries in all) before propagating.
+        ct = self.connect_timeout if connect_timeout is None else connect_timeout
+        rt = self.timeout if timeout is None else timeout
         s = self._session()
         if s is not None:
             last = None
-            for attempt in (0, 1):
+            for attempt in range(max(1, attempts)):
                 try:
-                    r = s.get(url, timeout=(self.connect_timeout, self.timeout),
-                              allow_redirects=True)
+                    r = s.get(url, timeout=(ct, rt), allow_redirects=True)
                 except requests.RequestException as e:
                     last = e
                     try:
@@ -190,14 +200,92 @@ class Fetcher:
                     continue
                 if r.status_code >= 400:
                     raise urllib.error.HTTPError(url, r.status_code, r.reason, None, None)
-                return r.content
+                return r.content, r.url
             raise last if last is not None else RuntimeError("http_get failed")
         req = urllib.request.Request(url, headers={"User-Agent": self.ua})
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return r.read()
+        with urllib.request.urlopen(req, timeout=rt) as r:
+            return r.read(), r.geturl()
+
+    # The manifest URL (redcdn: r.dcs.redcdn.pl) is a redirector that answers with a
+    # 302 to a node. The redirector can fail on its own (some of its addresses time
+    # out for minutes) while the nodes are fine, and every track refreshes the
+    # manifest each segment duration, so going through it each time stalls the
+    # whole tune with it. Instead the node it redirected to is pinned and the
+    # manifest refreshed straight from there:
+    #   - a node fetch gets short timeouts and no retry: on any failure the pin is
+    #     dropped and that same refresh goes through the redirector, which picks a
+    #     node again;
+    #   - every node_ttl seconds the redirector is asked again, in the background so
+    #     no refresh waits on it, and a node that went stale or the CDN wants to move
+    #     us off is left; if the redirector doesn't answer, the pinned node stays and
+    #     the re-check is repeated NODE_RETRY_LATER s later;
+    #   - only a token-less URL is pinned (no query string), and the pin belongs to
+    #     the mpd_url it came from: a videostar session refresh swaps mpd_url, and a
+    #     node URL would carry the old tokens.
+    NODE_CONNECT_TIMEOUT = 3.0
+    NODE_READ_TIMEOUT = 6.0
+    NODE_RETRY_LATER = 30.0   # redirector failed on a re-check: keep the node this long
+
+    def _pinned(self, src):
+        # (node url, due for a redirector re-check) for src, or (None, False).
+        with self._node_lock:
+            n = self._node
+            if n is None or n["src"] != src:
+                return None, False
+            return n["url"], time.monotonic() >= n["until"]
+
+    def _pin(self, src, final):
+        if not self.node_ttl or "?" in src:
+            return
+        if urllib.parse.urlsplit(final).netloc == urllib.parse.urlsplit(src).netloc:
+            return    # no redirect: nothing to pin
+        with self._node_lock:
+            old = self._node["url"] if self._node and self._node["src"] == src else None
+            self._node = {"src": src, "url": final, "until": time.monotonic() + self.node_ttl}
+        if final != old:
+            self.log("manifest node: %s" % urllib.parse.urlsplit(final).netloc)
+
+    def _unpin(self, src, node, why):
+        with self._node_lock:
+            if self._node and self._node["src"] == src and self._node["url"] == node:
+                self._node = None
+                self.log("manifest node %s failed (%s); back to the redirector"
+                         % (urllib.parse.urlsplit(node).netloc, why))
+
+    def _recheck(self, src):
+        # Background thread: ask the redirector again and re-pin to its answer.
+        try:
+            _raw, final = self._get(src)
+            self._pin(src, final)
+        except Exception as e:
+            self.log("redirector re-check failed (%s); staying on the node" % e)
+        finally:
+            s = getattr(self._local, "session", None)
+            if s is not None:
+                s.close()
+
+    def _get_mpd(self):
+        src = self.mpd_url
+        node, due = self._pinned(src)
+        if node and due:
+            # Claim the re-check (push `until` out, so the other tracks don't start
+            # one too) and run it in the background; this refresh uses the node.
+            with self._node_lock:
+                if self._node and self._node["src"] == src:
+                    self._node["until"] = time.monotonic() + self.NODE_RETRY_LATER
+            threading.Thread(target=self._recheck, args=(src,), daemon=True,
+                             name="dl-recheck").start()
+        if node:
+            try:
+                return self._get(node, self.NODE_CONNECT_TIMEOUT, self.NODE_READ_TIMEOUT, 1)[0]
+            except Exception as e:
+                self._unpin(src, node, e)
+        raw, final = self._get(src)
+        self._pin(src, final)
+        return raw
 
     def fetch_mpd(self):
-        raw = self.http_get(self.mpd_url)
+        raw = self._get_mpd()
         root = ET.fromstring(raw)
         base = None
         for e in root.iter():
@@ -751,6 +839,12 @@ def main():
     ap.add_argument("--connect-timeout", type=float, default=5.0,
                     help="per-request CONNECT timeout in seconds (default 5) — keeps a "
                          "dead/slow peer from stalling the full read timeout")
+    ap.add_argument("--node-ttl", type=float, default=300.0,
+                    help="refresh the manifest straight from the CDN node the redirector "
+                         "sent us to, and ask the redirector again only every this many "
+                         "seconds or when the node fails (default 300). Keeps a failing "
+                         "redirector (r.dcs.redcdn.pl) from stalling playback. 0 = always "
+                         "through the redirector.")
     ap.add_argument("--max-video-bw", type=int, default=0,
                     help="cap the chosen video Representation at this bandwidth (bits/s); "
                          "0 = no cap / pick the highest. Use on a thin link to pick a "

@@ -45,11 +45,20 @@
 # unstable link (a modem dropping out for seconds at a time) sails through them
 # while playback stalls. So the probe then watches the link for --live SECS
 # (default 60, 0 = off), polling like pilot-wp-dashlive in steady state: the
-# manifest once per segment duration (through the CDN's redirector), every newly
-# published segment on the keep-alive connection, and the Pilot WP API every 10 s
+# manifest once per segment duration (from the node the CDN's redirector sent it
+# to, see below), every newly published segment on the keep-alive connection, and
+# the Pilot WP API every 10 s
 # (heartbeats and a re-tune's key fetch need it). Failures, slow fetches and gaps
-# with no new segment are printed as they happen and feed the VERDICT. Deps: the
-# suite's own (curl, jq) plus python3 stdlib.
+# with no new segment are printed as they happen and feed the VERDICT.
+#
+# The DASH manifest URL is the CDN's redirector (r.dcs.redcdn.pl), which can fail
+# on its own while the nodes behind it and the link are fine. pilot-wp-dashlive
+# therefore refreshes the manifest straight from the node it was redirected to
+# (back to the redirector when the node fails, and every few minutes), and so does
+# the probe. The live run also polls the redirector itself, and when it fails,
+# tries each of its addresses in turn: the VERDICT tells a failing redirector (a
+# CDN problem, nothing to fix at home; it hits tunes, not running playback) from
+# an unstable link. Deps: the suite's own (curl, jq) plus python3 stdlib.
 set -euo pipefail
 
 usage="usage: pilot-wp-cdn-probe [--dash|--hls] [--wait SECS] [--live SECS] CHANNEL_ID [N_SEGS]"
@@ -176,7 +185,7 @@ fi
 echo
 
 "$PY" - "$path" "$url" "$PILOT_WP_UA" "$nseg" "$wait" "$live" "$gated" "$USER_URL" <<'PY'
-import sys, re, time, ssl, http.client, urllib.request, urllib.parse, urllib.error
+import sys, re, time, ssl, socket, threading, http.client, urllib.request, urllib.parse, urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -186,11 +195,66 @@ live_secs, gated, api_url = int(sys.argv[6] or "0"), sys.argv[7] == "1", sys.arg
 ln  = lambda t: t.rsplit("}", 1)[-1]
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 
-def get(u):
+ENTRY_HOST = urllib.parse.urlparse(url).netloc
+NODE_URL = None   # the manifest's URL after the redirector, once one is seen
+
+def get(u, timeout=20, pin=True):
+    # GET u -> (body, final URL, seconds). A fetch of the manifest URL that got
+    # redirected pins the node it landed on (token-less URLs only), as
+    # pilot-wp-dashlive does.
+    global NODE_URL
     req = urllib.request.Request(u, headers={"User-Agent": ua})
     t0 = time.monotonic()
-    with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
-        return r.read(), r.geturl(), time.monotonic() - t0
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+        body = r.read()
+        if (pin and u == url and "?" not in url
+                and urllib.parse.urlparse(r.geturl()).netloc != ENTRY_HOST):
+            NODE_URL = r.geturl()
+        return body, r.geturl(), time.monotonic() - t0
+
+def redirector_check(tries=5, timeout=8):
+    # Try every address of the manifest URL's host (the CDN's redirector) `tries`
+    # times on fresh connections, without following the redirect: a redirector
+    # with some dead addresses fails a share of the fetches that the link and the
+    # nodes don't. Returns [(ip, failed, tries, avg_ok_s, last_error)].
+    p = urllib.parse.urlparse(url)
+    host, port = p.hostname, p.port or (443 if p.scheme == "https" else 80)
+    path = p.path + ("?" + p.query if p.query else "")
+    try:
+        ips = sorted({a[4][0] for a in socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)})
+    except OSError as e:
+        print(f"REDIRECTOR  {host}: DNS lookup failed - {e}\n")
+        return []
+    print(f"REDIRECTOR  {host}: each of its {len(ips)} address(es) {tries}x on a fresh connection ...",
+          flush=True)
+    out = {}
+    def one(ip):
+        fail, ok_t, last = 0, [], ""
+        for _ in range(tries):
+            t0 = time.monotonic()
+            try:
+                sock = socket.create_connection((ip, port), timeout=timeout)
+                if p.scheme == "https":
+                    sock = ctx.wrap_socket(sock, server_hostname=host)
+                c = http.client.HTTPConnection(host, port, timeout=timeout); c.sock = sock
+                c.request("GET", path, headers={"User-Agent": ua})
+                r = c.getresponse(); r.read(); c.close()
+                if r.status >= 400:
+                    raise RuntimeError(f"HTTP {r.status}")
+                ok_t.append(time.monotonic() - t0)
+            except Exception as e:
+                fail += 1; last = f"{type(e).__name__}: {e}"
+            time.sleep(1)
+        out[ip] = (ip, fail, tries, sum(ok_t) / len(ok_t) if ok_t else None, last)
+    th = [threading.Thread(target=one, args=(ip,)) for ip in ips]
+    for t in th: t.start()
+    for t in th: t.join()
+    res = [out[ip] for ip in ips]
+    for ip, f, n, avg, last in res:
+        tail = (f"avg {avg*1000:.0f}ms" if avg is not None else "none succeeded") + (f"; last error {last}" if f else "")
+        print(f"   {ip:15s} {f}/{n} failed; {tail}")
+    print()
+    return res
 
 def split_url(u):
     p = urllib.parse.urlparse(u)
@@ -378,6 +442,19 @@ def bwof(rep):
     return int(rep.attrib.get("bandwidth", "0"))
 
 def load_mpd():
+    # Like pilot-wp-dashlive: from the pinned node (short timeout, no retry), back
+    # to the redirector when that fails.
+    global NODE_URL
+    if NODE_URL:
+        try:
+            raw, eff, mpd_t = get(NODE_URL, timeout=6)
+            root = ET.fromstring(raw)
+            base = next((e.text.strip() for e in root.iter() if ln(e.tag) == "BaseURL" and e.text), eff)
+            return root, base, mpd_t
+        except Exception as e:
+            print(f"   manifest node {urllib.parse.urlparse(NODE_URL).netloc} failed "
+                  f"({type(e).__name__}: {e}); back to the redirector", flush=True)
+            NODE_URL = None
     raw, eff, mpd_t = get(url)
     root = ET.fromstring(raw)
     base = next((e.text.strip() for e in root.iter() if ln(e.tag) == "BaseURL" and e.text), eff)
@@ -526,15 +603,21 @@ def live_seg(t, u):
     if h != t.host:
         if t.conn: t.conn.close()
         t.host, t.conn = h, new_conn(h)
+    # A keep-alive connection left idle (e.g. while the manifest couldn't be
+    # refreshed) gets closed by the server; like pilot-wp-dashlive, retry once on
+    # a fresh connection, and only a failed retry counts.
     t0 = time.monotonic()
-    try:
-        t.conn.request("GET", path, headers={"User-Agent": ua})
-        r = t.conn.getresponse(); r.read()
-    except Exception as e:
-        try: t.conn.close()
-        except Exception: pass
-        t.conn = new_conn(t.host)
-        return time.monotonic() - t0, f"{type(e).__name__}: {e} (connection dropped)"
+    for attempt in (0, 1):
+        try:
+            t.conn.request("GET", path, headers={"User-Agent": ua})
+            r = t.conn.getresponse(); r.read()
+            break
+        except Exception as e:
+            try: t.conn.close()
+            except Exception: pass
+            t.conn = new_conn(t.host)
+            if attempt:
+                return time.monotonic() - t0, f"{type(e).__name__}: {e} (also on a fresh connection)"
     return time.monotonic() - t0, (None if r.status == 200 else f"HTTP {r.status}")
 
 def api_check():
@@ -568,6 +651,13 @@ def live(tracks, refresh):
           f"keep-alive connection per track, Pilot WP API every {API_EVERY}s. Problems as they happen:",
           flush=True)
     man = Stat("manifest", cad)
+    # The manifest comes from the pinned node, as in pilot-wp-dashlive; the
+    # redirector is polled too, on its own, to catch it failing (it is what a tune
+    # and a DRM key fetch go through first).
+    rd = Stat("redirector", cad) if NODE_URL else None
+    if rd:
+        print(f"   (manifest from the node {urllib.parse.urlparse(NODE_URL).netloc}, like "
+              f"pilot-wp-dashlive; 'redirector' = the same request through {ENTRY_HOST})", flush=True)
     api = Stat("Pilot WP API", 5.0)
     st = {t.label: Stat(t.label, t.seg_dur) for t in tracks}
     for t in tracks:            # report() closed the burst connections
@@ -575,6 +665,23 @@ def live(tracks, refresh):
     t0 = time.monotonic()
     last_ok = {t.label: t0 for t in tracks}
     next_api = t0
+    stop = threading.Event()
+    def poll_redirector():
+        # Its own thread, one request at a time: a hanging redirector must not
+        # hold up the playback path being measured.
+        while not stop.is_set():
+            ds = time.monotonic()
+            try:
+                get(url, pin=False); err = None
+            except Exception as e:
+                err = f"{type(e).__name__}: {e}"
+            if stop.is_set():
+                break        # answered after the run ended: not part of it
+            rd.add(ds - t0, time.monotonic() - ds, err)
+            stop.wait(max(0.0, cad - (time.monotonic() - ds)))
+    poller = threading.Thread(target=poll_redirector, daemon=True) if rd else None
+    if poller:
+        poller.start()
     try:
         while time.monotonic() - t0 < secs:
             cs = time.monotonic()
@@ -605,18 +712,25 @@ def live(tracks, refresh):
     except KeyboardInterrupt:
         print("   (interrupted)")
     end = time.monotonic()
+    stop.set()
+    if poller:
+        poller.join(timeout=1)   # a request still hanging is left behind (daemon)
     for t in tracks:
         st[t.label].gap = max(st[t.label].gap, end - last_ok[t.label])
         if t.conn: t.conn.close()
     print(f"   --- after {end - t0:.0f}s:")
     man.line()
+    if rd:
+        rd.line()
     for t in tracks:
         st[t.label].line(f"; longest gap between segments {st[t.label].gap:.1f}s "
                          f"(stalls beyond {3*t.seg_dur:.0f}s)")
     if api_url:
         api.line()
     print()
-    return dict(secs=end - t0, man=man, api=api if api_url else None,
+    trouble = rd if rd else man   # without a pinned node the manifest itself goes through it
+    redir = redirector_check() if mode == "dash" and (trouble.fail or trouble.slow) else None
+    return dict(secs=end - t0, man=man, rd=rd, redir=redir, api=api if api_url else None,
                 tracks=[(st[t.label], t.seg_dur) for t in tracks])
 
 def live_verdict(L):
@@ -636,6 +750,25 @@ def live_verdict(L):
     slow = ([f"manifest up to {man.max*1000:.0f}ms"] if man.slow else []) \
          + [f"{s.name} up to {s.max*1000:.0f}ms" for s, _ in L["tracks"] if s.slow] \
          + ([f"Pilot WP API up to {api.max*1000:.0f}ms"] if api and api.slow else [])
+    # The redirector is to blame when it failed or was slow while the playback path
+    # (manifest from the node, segments, API) held up.
+    rd, redir = L["rd"], L["redir"] or []
+    bad_ips = [r[0] for r in redir if r[1]]
+    some_ips = bool(bad_ips) and len(bad_ips) < len(redir)
+    if rd and (rd.fail or rd.slow):
+        line = (f"  REDIRECTOR: {ENTRY_HOST} is failing - over {L['secs']:.0f}s {rd.fail}/{rd.n} requests "
+                f"through it failed and {rd.slow} were slow (up to {rd.max*1000:.0f}ms)")
+        if bad:
+            print(line + ". The link is unstable too (below), which may be all of it.")
+        else:
+            print(line + ", while the playback path held up: on the CDN's side, nothing to fix at home "
+                  "(modem, line).")
+            if bad_ips:
+                print(f"          Failing address(es): {', '.join(bad_ips)}"
+                      + (f" (ok: {', '.join(x[0] for x in redir if not x[1])})" if some_ips else "") + ".")
+            print("          Running playback reads the manifest from its node and rides it out. It hits "
+                  "tunes: their first manifest fetch and the DRM key fetch go through it - a slow start, "
+                  "or the connection slate. Wait it out and re-run the probe.")
     if bad:
         print(f"  LIVE: the link is UNSTABLE - over {L['secs']:.0f}s: " + "; ".join(bad) + ".")
         print("          Playback stalls and stops like this, and a re-tune can't reach the server (the "
@@ -655,7 +788,15 @@ except urllib.error.HTTPError as e:
         print("   -> the URL's tokens were refused (session closed or expired); re-run the probe.")
     sys.exit(1)
 except (urllib.error.URLError, OSError) as e:
-    print(f"manifest/playlist fetch failed: {type(e).__name__}: {e}")
+    print(f"manifest/playlist fetch failed: {type(e).__name__}: {e}\n")
+    redir = redirector_check()
+    bad_ips = [r[0] for r in redir if r[1]]
+    if bad_ips and len(bad_ips) < len(redir):
+        print(f"VERDICT\n  only some addresses of {ENTRY_HOST} fail ({', '.join(bad_ips)}): the CDN's "
+              f"redirector, not your link. Nothing to fix at home; re-run the probe.")
+    elif bad_ips:
+        print(f"VERDICT\n  every address of {ENTRY_HOST} fails: the link (or the CDN) is down; re-run "
+              f"the probe.")
     sys.exit(1)
 try:
     sample(tracks, refresh)
