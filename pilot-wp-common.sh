@@ -618,7 +618,10 @@ emit_slate() {
         fi
     fi
 
-    local inputs=(-f lavfi -i "color=c=${bg}:s=${size}:r=25" -f lavfi -i "anullsrc=r=48000:cl=stereo")
+    # -re paces the generated sources at real time: without it ffmpeg encodes the
+    # slate ~20x faster than it plays, tvheadend buffers it all, and the encoder
+    # pins every core (200%+ on a Pi 4) for as long as the slate is up.
+    local inputs=(-re -f lavfi -i "color=c=${bg}:s=${size}:r=25" -re -f lavfi -i "anullsrc=r=48000:cl=stereo")
     local fc
     if [[ -n "$logo" ]]; then
         inputs+=(-i "$logo")
@@ -641,7 +644,7 @@ emit_slate() {
         "${inputs[@]}" \
         -filter_complex "$fc" \
         -map "[v]" -map 1:a \
-        -c:v libx264 -preset veryfast -tune stillimage -pix_fmt yuv420p -g 50 \
+        -c:v libx264 -preset ultrafast -tune stillimage -pix_fmt yuv420p -g 50 -threads 1 \
         -c:a aac -b:a 64k \
         -f mpegts -mpegts_flags +initial_discontinuity -
     local rc=$?
