@@ -7,6 +7,7 @@ Zestaw skryptów, dzięki którym kanały [Pilota WP](https://pilot.wp.pl) obejr
 Co dostajesz:
 
 - **Listę kanałów dla tvheadend** — z logo i podziałem na kategorie. Trafiają na nią kanały bezpłatne i te, które obejmuje Twój abonament.
+- **Program telewizyjny (EPG)** dla tych kanałów — tytuły, opisy, zdjęcia i kategorie wiekowe (zobacz [Program telewizyjny](#opcjonalnie-program-telewizyjny-epg)).
 - **Obraz i dźwięk w oryginalnej jakości** — strumienie nie są przekodowywane, a wszystkie ścieżki dźwiękowe są zachowane.
 - **Czytelną informację zamiast błędu** — gdy kanału nie da się włączyć (np. przekroczono limit jednoczesnych transmisji na koncie), na ekranie pojawia się plansza z wyjaśnieniem.
 - **Opcjonalnie: kanały chronione DRM** (np. TVN) — jeśli dostarczysz własny plik urządzenia Widevine (zobacz [Kanały z DRM](#opcjonalnie-kanały-z-drm)).
@@ -23,6 +24,7 @@ Co dostajesz:
 - [Krok 5. Utwórz listę kanałów](#krok-5-utwórz-listę-kanałów)
 - [Krok 6. Dodaj kanały do tvheadend](#krok-6-dodaj-kanały-do-tvheadend)
 - [Krok 7. Nie pozwól, żeby sesja wygasła](#krok-7-nie-pozwól-żeby-sesja-wygasła)
+- [Opcjonalnie: program telewizyjny (EPG)](#opcjonalnie-program-telewizyjny-epg)
 - [Opcjonalnie: kanały z DRM](#opcjonalnie-kanały-z-drm)
 - [Opcjonalnie: automatyczne odświeżanie listy kanałów](#opcjonalnie-automatyczne-odświeżanie-listy-kanałów)
 - [Typowe problemy](#typowe-problemy)
@@ -207,6 +209,25 @@ i dopisz na końcu wiersz:
 
 `pilot-wp-ping` nie zajmuje limitu transmisji i niczego nie wypisuje, gdy wszystko jest w porządku. Jeśli sesja mimo to wygaśnie, po prostu połącz konto ponownie.
 
+## Opcjonalnie: program telewizyjny (EPG)
+
+Skrypty mogą też dostarczać program telewizyjny dla kanałów z Twojej listy. Pilot WP publikuje go tylko na około 12 godzin naprzód, dlatego tvheadend sam pobiera go co kilka godzin i zachowuje to, co już otrzymał.
+
+1. **Na serwerze:** pozwól tvheadend znaleźć skrypt z programem, a potem uruchom tvheadend ponownie (np. `sudo systemctl restart tvheadend` albo uruchom ponownie serwer):
+
+   ```bash
+   sudo ln -s /home/xbian/.hts/tvheadend/scripts/pilot-wp-cli/pilot-wp-epg /usr/bin/tv_grab_pilotwp
+   ```
+
+2. **W interfejsie WWW tvheadend:** przejdź do **Configuration** → **Channel / EPG** → **EPG Grabber Modules**, zaznacz **Internal: XMLTV: Pilot WP**, włącz **Enabled** i kliknij **Save**.
+3. Przejdź do **Configuration** → **Channel / EPG** → **EPG Grabber**. W polu **Cron multi-line** zastąp harmonogram poniższym wierszem (co 6 godzin), kliknij **Save**, a potem **Re-run internal EPG grabbers**:
+
+   ```cron
+   4 */6 * * *
+   ```
+
+Po minucie lub dwóch program pojawi się w tvheadend i w Kodi. Stacje radiowe i część kanałów muzycznych nie mają programu.
+
 ## Opcjonalnie: kanały z DRM
 
 Niektóre kanały (np. TVN) są chronione systemem Widevine DRM. Domyślnie zamiast nich wyświetla się plansza z informacją. Żeby je oglądać, potrzebujesz własnego **pliku urządzenia Widevine L3** (`.wvd`). Projekt go nie zawiera — tworzysz go sam z emulatora Androida uruchomionego na własnym komputerze i sam odpowiadasz za zgodne z prawem korzystanie z niego (zobacz [zastrzeżenia](DISCLAIMER.md)).
@@ -267,7 +288,7 @@ Dlatego zalecamy tworzenie listy ręcznie ([krok 5](#krok-5-utwórz-listę-kana�
 - **W tvheadend nie ma żadnych kanałów** — sprawdź, czy adres listy ma trzy ukośniki (`file:///…`), czy plik `channels.m3u` istnieje i należy do użytkownika tvheadend, a potem ponownie wykonaj **Force Scan** i **Map services** (krok 6).
 - **Obraz się zacina** — zwiększ zapas danych, który skrypty pobierają z wyprzedzeniem. W `config.env` (utwórz go jak w sekcji o DRM, punkt 3) zamień wiersz `#PILOT_WP_DASHLIVE_ARGS=` na `PILOT_WP_DASHLIVE_ARGS="--prebuffer 30"`. Przy wolnym łączu możesz też obniżyć jakość obrazu: `PILOT_WP_DASHLIVE_ARGS="--prebuffer 30 --max-video-bw 4000000"`.
 - **Kanał radiowy jest na liście kanałów telewizyjnych** — zobacz uwagę o kanałach radiowych w [kroku 6](#krok-6-dodaj-kanały-do-tvheadend).
-- **Brak programu telewizyjnego (EPG)** — skrypty nie dostarczają programu. Możesz podłączyć w tvheadend zewnętrzne źródło EPG (XMLTV).
+- **Brak programu telewizyjnego (EPG)** — skonfiguruj go tak, jak opisano w sekcji [Program telewizyjny](#opcjonalnie-program-telewizyjny-epg). Jeśli na liście modułów nie ma **Internal: XMLTV: Pilot WP**, sprawdź dowiązanie `tv_grab_pilotwp` i uruchom tvheadend ponownie. `sudo -u xbian ./pilot-wp-epg >/dev/null` pokaże, ile kanałów i audycji pobrano, albo co poszło nie tak. Jeśli lista kanałów powstała dawno, a któryś kanał zmienił od tego czasu nazwę, utwórz listę ponownie ([krok 5](#krok-5-utwórz-listę-kanałów)) — program jest przypisywany do kanałów po nazwie.
 - **Strona logowania się nie otwiera** — komputer musi być w tej samej sieci domowej co serwer. Upewnij się, że używasz adresu wypisanego w terminalu i że zapora sieciowa serwera przepuszcza port `8199` (inny port ustawisz opcją `--port`).
 - **„Permission denied” przy uruchamianiu skryptów** — skrypty straciły prawo uruchamiania, np. przy kopiowaniu z Windowsa. Wykonaj ponownie `sudo chmod +x pilot-wp-*`.
 

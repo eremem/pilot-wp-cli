@@ -4,7 +4,7 @@ This is the detailed reference: every tool and setting, how the pieces fit toget
 
 A small bash CLI that lets you watch [Pilot WP](https://pilot.wp.pl) — a Polish IPTV service — outside its official app. It is designed to plug into [tvheadend](https://tvheadend.org/) on a Linux media box: tvheadend imports the channel list as an IPTV network and re-serves the streams to any local client (Kodi via the tvh-htsp addon, VLC, Jellyfin, etc.).
 
-The CLI handles authentication, channel discovery, per-tune stream resolution, the v3 heartbeat, and releasing the stream slot on teardown. Free-to-air channels are read from their DASH manifest by `pilot-wp-dashlive` and stream-copied by ffmpeg to MPEG-TS on stdout (HLS straight into ffmpeg is the fallback); nothing is transcoded. Channels that can't be streamed (the account's concurrent-stream limit, or DRM channels when DRM playback is off) show an on-screen slate instead of failing the tune. Widevine-DRM channels can optionally be decrypted — see [DRM playback](#drm-playback-optional).
+The CLI handles authentication, channel discovery, the programme guide (XMLTV), per-tune stream resolution, the v3 heartbeat, and releasing the stream slot on teardown. Free-to-air channels are read from their DASH manifest by `pilot-wp-dashlive` and stream-copied by ffmpeg to MPEG-TS on stdout (HLS straight into ffmpeg is the fallback); nothing is transcoded. Channels that can't be streamed (the account's concurrent-stream limit, or DRM channels when DRM playback is off) show an on-screen slate instead of failing the tune. Widevine-DRM channels can optionally be decrypted — see [DRM playback](#drm-playback-optional).
 
 It targets Pilot WP's `/api/v3` endpoints, falling back to `/api/v2` / `/api/v1` where v3 has no equivalent.
 
@@ -116,6 +116,8 @@ When the session goes stale, log in again (`./pilot-wp-login --web` or `./pilot-
 | `PILOT_WP_M3U_DRM_SCAN` | `1` | `pilot-wp-m3u` probes channels (releasing each session) to add a `DRM` tvh-tag — the channel list has no DRM flag. Results are cached and only unknown/expired channels are probed. `0` = no probing, no cache, no DRM tag. |
 | `PILOT_WP_M3U_CACHE_TTL_DAYS` | `7` | Re-probe a cached channel once its entry is older than this (max 7). |
 | `PILOT_WP_M3U_CACHE` | `$PILOT_WP_HOME/.m3u-drm-cache.tsv` | DRM-status cache (pruned to currently subscribed channels on each scan). |
+| `PILOT_WP_EPG_BATCH` | `20` | `pilot-wp-epg`: channels per guide request (max 50 — the API drops the rest). |
+| `PILOT_WP_EPG_LIMIT` | `20` | `pilot-wp-epg`: programmes per channel (max 20, the API's cap). Lower = a shorter guide. |
 | `PILOT_WP_DRM_VERIFY_TIMEOUT` | `8` | When a channel advertises a `drms` block, its DASH manifest is checked; if it has no `ContentProtection` and an HLS URL exists, it plays as free-to-air (some channels, e.g. ViDocTV, advertise `drms` but are clear). This is the timeout in seconds for that fetch; a failed fetch keeps the channel as DRM. |
 | `PILOT_WP_DRM_ENABLE` | `0` | `1` = decrypt and play Widevine DRM channels (see [DRM playback](#drm-playback-optional)); `0` = show the DRM slate. |
 | `PILOT_WP_WVD` | first `*.wvd` in `widevine/` next to the scripts | Widevine L3 device file (`chmod 600`). Required for DRM playback. |
@@ -163,6 +165,7 @@ The tools:
 | `pilot-wp-sessions [list\|remove …]` | Anytime | Lists and removes the account's login sessions; see [Managing sessions](#managing-sessions). |
 | `pilot-wp-favourites [list\|add\|remove …]` | Anytime | Lists and edits favourite channels; see [Managing favourites](#managing-favourites). |
 | `pilot-wp-m3u [--rescan] OUTPUT_PATH` | After login, and again when the channel lineup changes (cron optional — see [Daily channel-list refresh](#daily-channel-list-refresh-cron)) | Writes a tvheadend M3U whose entries are `pipe://` invocations of `pilot-wp-stream`; `--rescan` re-probes every channel's DRM status, ignoring the cache. No stream URLs are embedded, so it doesn't go stale when tokens expire. |
+| `pilot-wp-epg [--output PATH] [--quiet]` | Every few hours — run by tvheadend as an XMLTV grabber, or from cron | Writes the programme guide (XMLTV) for the M3U's channels to stdout or `PATH`; see [Programme guide (EPG)](#programme-guide-epg). |
 | `pilot-wp-stream CHANNEL_ID ['NAME'] ['THUMB_URL'] [AUDIO_ONLY]` | Invoked by tvheadend per tune | Opens the channel, heartbeats it, and writes MPEG-TS to stdout; DRM (when not enabled) and over-limit channels get a slate, and so does a tune that can't reach Pilot WP. |
 | `diagnostics/pilot-wp-cdn-probe [--dash\|--hls] [--wait SECS] [--live SECS] CHANNEL_ID [N_SEGS]` | When a channel stutters or stops | Measures whether this box can fetch the channel's segments fast enough, and whether the link stays up; see [Diagnosing a stutter](#diagnosing-a-stutter). Not used during playback. |
 | `pilot-wp-common.sh` | Sourced by the others | Library; not directly runnable. |
@@ -173,7 +176,7 @@ The tools:
 ./pilot-wp-m3u /path/to/channels.m3u
 ```
 
-One `#EXTINF`/`pipe://` pair per free or subscribed channel (`unsubscribed` channels are skipped). Each `#EXTINF` carries `tvg-id`/`tvg-chno`/`tvg-logo`/`tvg-name`, `group-title` (Polish category), `tvh-tags` (`HD`/`SD`/`Radio` + categories, plus `DRM` — see `PILOT_WP_M3U_DRM_SCAN`), `tvh-bouquet="Pilot WP"`, and `tvh-epg="0"`. The `pipe://` line passes the channel id, the name (→ MPEG-TS SDT `service_name`), the thumbnail (→ slate logo), and an audio-only flag. The file is written atomically (`mktemp` + `mv`).
+One `#EXTINF`/`pipe://` pair per free or subscribed channel (`unsubscribed` channels are skipped). Each `#EXTINF` carries `tvg-id`/`tvg-chno`/`tvg-logo`/`tvg-name`, `group-title` (Polish category), `tvh-tags` (`HD`/`SD`/`Radio` + categories, plus `DRM` — see `PILOT_WP_M3U_DRM_SCAN`), `tvh-bouquet="Pilot WP"`, and `tvh-epg="0"` (no EIT scan, which would open a stream slot just to read the broadcast guide — the guide comes from [`pilot-wp-epg`](#programme-guide-epg), whose channel ids equal these `tvg-id`s). The `pipe://` line passes the channel id, the name (→ MPEG-TS SDT `service_name`), the thumbnail (→ slate logo), and an audio-only flag. The file is written atomically (`mktemp` + `mv`).
 
 > **Radio channels.** tvheadend decides radio vs. TV from the stream's SDT `service_type`, not from the M3U (its IPTV parser ignores `radio="true"`), so `pilot-wp-stream` marks audio-only channels `digital_radio`. tvheadend only sees this once it has read the SDT: after (re)generating the M3U, force-scan the IPTV muxes (or play each radio channel once), or set *Service Type = Radio* per service in the Services UI.
 
@@ -230,6 +233,34 @@ lines of the generated M3U). They don't prompt and are idempotent server-side.
 2. *URL* = `file:///absolute/path/to/channels.m3u`. Turn *Scan after creation* / *Idle scan muxes* off (idle scans launch tunes nobody is watching and use up stream slots).
 3. Force-scan once; map services → channels.
 4. Open a channel from any client — tvheadend runs the `pipe://` child and reads MPEG-TS from its stdout.
+
+### Programme guide (EPG)
+
+`pilot-wp-epg` writes an XMLTV guide for exactly the channels `pilot-wp-m3u` lists (free and subscribed). Each `<channel id>` equals the channel's M3U `tvg-id` (its name), which tvheadend stores as the IPTV service's EPG id, so the guide binds to the right channels by itself.
+
+```bash
+./pilot-wp-epg                              # XMLTV on stdout (the grabber convention)
+./pilot-wp-epg --output /path/to/guide.xml  # or write a file (atomic, mode 644)
+./pilot-wp-epg --list-channels              # channels only, no programmes
+```
+
+Programmes carry title, description (series and episode text), category, picture and the Polish age rating (`<rating system="PL">`). The guide comes from `/api/v2/epg`, which serves **at most 20 programmes per channel, at most ~12 hours ahead, and nothing from the past** — there is no way to ask for more. There is no cache: tvheadend keeps its own guide database and merges each import, so running the grabber every few hours keeps ~12 hours of guide ahead. Radio and a few music channels have no guide data.
+
+**As a tvheadend grabber (recommended).** tvheadend picks up executables named `tv_grab_*` from its `PATH` at start-up and runs them on its EPG schedule as the tvheadend user (the same user that reads the cookie jar for streaming):
+
+1. `sudo ln -s /home/USER/.hts/tvheadend/scripts/pilot-wp-cli/pilot-wp-epg /usr/bin/tv_grab_pilotwp`, then restart tvheadend. Use `/usr/bin`: tvheadend only scans its own `PATH`, which doesn't include `/usr/local/bin` everywhere (e.g. on xbian).
+2. *Configuration* → *Channel / EPG* → *EPG Grabber Modules* → enable **Internal: XMLTV: Pilot WP**.
+3. *Configuration* → *Channel / EPG* → *EPG Grabber* → set the internal grabber's cron to every 6 hours, e.g. `4 */6 * * *` (the default twice a day leaves gaps with a 12-hour guide), save, and press *Re-run internal EPG grabbers*.
+
+If the `xmltv-util` package is installed, tvheadend lists grabbers through its `tv_find_grabbers` instead of scanning `PATH`; `pilot-wp-epg` answers `--description` and `--capabilities` (`baseline`) for it. Other grabber options (`--days`, `--offset`, `--config-file`) are accepted and ignored.
+
+**As a file (cron).** For other XMLTV consumers (e.g. Kodi's *IPTV Simple Client*, or tvheadend's *XMLTV: tv_grab_file*):
+
+```cron
+15 */6 * * * /home/USER/.hts/tvheadend/scripts/pilot-wp-cli/pilot-wp-epg --quiet --output /home/USER/.hts/tvheadend/scripts/pilot-wp-cli/guide.xml
+```
+
+Nothing is written until the whole guide is built. If one request fails, its channels are left out and the rest is still written (tvheadend keeps their earlier programmes). If the session is invalid or every request fails, nothing is written (an existing `--output` file is left as is) and the exit is non-zero — tvheadend treats empty grabber output as a failed grab and keeps the guide it has. Warnings go to stderr; `--quiet` only drops the summary line.
 
 ### Daily channel-list refresh (cron)
 
@@ -301,8 +332,9 @@ Endpoints and headers are constants at the top of `pilot-wp-common.sh`; if Pilot
 | `0` | any | Success / clean ffmpeg or slate exit. |
 | `2` | `resolve_auth` | Jar invalid/expired and no TTY to refresh it (and no working creds). Usually: tvheadend invoked the script and `cookies.txt` is missing/stale/unreadable — run `pilot-wp-login`. |
 | `3` | `resolve_auth` | Supplied credentials/cookies rejected by the API. Re-run `pilot-wp-login` with fresh cookies. |
-| `4` | `pilot-wp-account-info` / `pilot-wp-m3u` | Not authenticated / channel list not an array — cookies bad or expired. |
+| `4` | `pilot-wp-account-info` / `pilot-wp-m3u` / `pilot-wp-epg` | Not authenticated / channel list not an array — cookies bad or expired. |
 | `5` | `pilot-wp-stream` | All `PILOT_WP_RETRIES` attempts failed with Pilot WP reachable (an unreachable one gets the connection slate instead). Check stderr. |
+| `5` | `pilot-wp-epg` | Every guide request failed; nothing was written. |
 | `1` | `pilot-wp-status` | At least one FAIL item needs attention before streaming. |
 | `1` | `pilot-wp-ping` | Session dead: jar missing/empty, or the API rejected it. Run `pilot-wp-login`. |
 | `2` | `pilot-wp-ping` | Transport failure: API unreachable / timed out / jar lock busy. The next run retries. |
@@ -315,6 +347,7 @@ Endpoints and headers are constants at the top of `pilot-wp-common.sh`; if Pilot
 - **A channel shows the DRM slate** — the channel is Widevine-encrypted and DRM playback is off; see [DRM playback](#drm-playback-optional). If it's enabled and you still get the slate, set `PILOT_WP_DRM_KEY_LOG` and `PILOT_WP_TRACE=1` and check the `pilot-wp-getkeys` output (expired `.wvd`, license rejected, or `PILOT_WP_PYTHON` can't import pywidevine). `./pilot-wp-status` checks the DRM prerequisites.
 - **A channel shows the stream-limit slate** — the account's concurrent-stream cap is reached. Stop another stream or device; a stopped tune frees its slot within seconds, an abandoned one within ~20–40 s.
 - **tvheadend says "no available adapters" / sessions pile up while zapping** — slots aren't being released on teardown (see [How it works](#how-it-works)). Check that `setsid` exists (`command -v setsid`; without it slots only self-expire after ~20–40 s), set `PILOT_WP_RELEASE_LOG` and look for `release: ok` after each stop, and remember that a browser session on the same account also holds a slot. To clear leftover processes: `pkill -9 -f pilot-wp-stream; pkill -9 -f pilot-wp-dashlive; pkill -9 -f 'pilot-wp-drm-|videostar|color=c='`, and restart tvheadend if its subscription count stays stale.
+- **No guide for a channel** — radio and some music channels have no guide data at all. Otherwise run `./pilot-wp-epg >/dev/null` as the tvheadend user and read stderr; in tvheadend check *Channel / EPG* → *EPG Grabber Channels* that the Pilot WP entry is linked to the channel (it binds by the M3U `tvg-id`, so a channel renamed since the M3U was generated needs a fresh M3U or a manual link). If the grabber is missing from *EPG Grabber Modules*, check that the `tv_grab_pilotwp` symlink is in tvheadend's `PATH` and executable, and restart tvheadend.
 - **ffmpeg reports HTTP 400 on the stream** — the session cookie was sent to the CDN; stream URLs must be fetched with only the `User-Agent`.
 - **A channel stalls or re-buffers (DASH)** — give `pilot-wp-dashlive` more headroom via `PILOT_WP_DASHLIVE_ARGS`: a larger `--prebuffer`, `--parallel` ≥ 2, or `--max-video-bw` to pick a lighter rendition on a slow link. `--verbose` logs per-segment timing. To find out whether the link is the limit, see [Diagnosing a stutter](#diagnosing-a-stutter).
 - **HLS fallback only:**
@@ -411,6 +444,7 @@ pilot-wp-cli/
 ├── pilot-wp-sessions     list/remove account login sessions (★ = ours, never removable)
 ├── pilot-wp-favourites   list/add/remove favourite channels
 ├── pilot-wp-m3u          M3U generator (v3 channels/list)
+├── pilot-wp-epg          XMLTV programme guide for the M3U's channels (tvheadend grabber or file)
 ├── pilot-wp-stream       per-tune script invoked by tvheadend
 ├── pilot-wp-getkeys      Widevine license helper (optional DRM playback)
 ├── pilot-wp-dashlive     in-order live-DASH segment fetcher (FTA and DRM playback)

@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# pilot-wp-epg [--output PATH | -] [--quiet]
+# pilot-wp-epg --list-channels | --description | --capabilities | --version
+#
+# Writes an XMLTV programme guide for exactly the channels pilot-wp-m3u lists,
+# with <channel id> equal to the M3U tvg-id (both come from the library's
+# JQ_LINEUP_DEFS), so tvheadend binds the guide to the M3U services by itself.
+#
+# Output goes to stdout by default — the XMLTV grabber convention, so the tool
+# can be installed as a tvheadend internal grabber via a symlink named
+# tv_grab_* (e.g. /usr/bin/tv_grab_pilotwp). --output PATH writes a file
+# atomically instead (for cron + other XMLTV consumers).
+#
+# Source: /api/v2/epg, which serves ≤20 programmes per channel and ≤~12 h
+# ahead, nothing from the past, and has no date/paging parameter. There is no
+# cache here: tvheadend keeps its own EPG database and merges each import, so
+# re-running the grabber every few hours keeps the guide ~12 h ahead.
+#
+# Failure policy: nothing is written until the whole document is built. If a
+# batch request fails the rest is still emitted (tvheadend keeps the channels it
+# didn't get); if the session is invalid or every request fails, nothing is
+# written and the exit is non-zero — tvheadend treats empty grabber output as a
+# failed grab and keeps the guide it has.
+set -euo pipefail
+
+usage="usage: pilot-wp-epg [--output PATH | -] [--quiet]
+       pilot-wp-epg --list-channels | --description | --capabilities | --version"
+OUT=-
+QUIET=0
+MODE=guide
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        # XMLTV grabber handshake (tvheadend calls --description to name it).
+        --description)   echo "Pilot WP"; exit 0 ;;
+        --capabilities)  echo "baseline"; exit 0 ;;
+        --version)       echo "pilot-wp-epg (pilot-wp-cli)"; exit 0 ;;
+        --configure)     echo "pilot-wp-epg: nothing to configure (the channel set follows the M3U; log in with pilot-wp-login)" >&2; exit 0 ;;
+        --list-channels) MODE=channels; shift ;;
+        -o|--output)     [[ $# -ge 2 ]] || { echo "pilot-wp-epg: $1 needs a path ($usage)" >&2; exit 2; }
+                         OUT=$2; shift 2 ;;
+        --output=*)      OUT=${1#*=}; shift ;;
+        --quiet)         QUIET=1; shift ;;
+        # Baseline grabber options with nothing to tune: the API serves a fixed
+        # ~12 h window and the channel set is the M3U's.
+        --days|--offset|--config-file)
+                         [[ $# -ge 2 ]] || { echo "pilot-wp-epg: $1 needs a value ($usage)" >&2; exit 2; }
+                         shift 2 ;;
+        --days=*|--offset=*|--config-file=*) shift ;;
+        -h|--help)       echo "$usage"; exit 0 ;;
+        *)               echo "pilot-wp-epg: unknown argument: $1 ($usage)" >&2; exit 2 ;;
+    esac
+done
+
+_self_dir=$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || echo "$0")")" && pwd)
+# shellcheck source=pilot-wp-common.sh
+source "$_self_dir/pilot-wp-common.sh"
+
+# stderr only — stdout carries the XMLTV document. --quiet silences the
+# summary, never a warning.
+log()  { (( QUIET )) || printf 'pilot-wp-epg: %s\n' "$*" >&2; }
+warn() { printf 'pilot-wp-epg: warning: %s\n' "$*" >&2; }
+
+# Clamp a knob to 1..MAX (non-numeric → MAX).
+clamp() {
+    local v=$1 max=$2
+    [[ "$v" =~ ^[0-9]+$ ]] || v=$max
+    (( v < 1 )) && v=1
+    (( v > max )) && v=$max
+    echo "$v"
+}
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+resolve_auth
+
+rc=0
+fetch_lineup > "$work/lineup.json" || rc=$?
+if (( rc != 0 )); then
+    echo "pilot-wp-epg: channels/list returned no channel list; check creds / connectivity" >&2
+    exit 4
+fi
+mapfile -t ids < <(jqr "$JQ_LINEUP_DEFS"' lineup | .id' "$work/lineup.json")
+if (( ${#ids[@]} == 0 )); then
+    echo "pilot-wp-epg: the account has no playable channels" >&2
+    exit 4
+fi
+
+# --- Fetch the guide ----------------------------------------------------------
+: > "$work/epg.jsonl"
+if [[ "$MODE" == guide ]]; then
+    batch=$(clamp "$PILOT_WP_EPG_BATCH" 50)
+    limit=$(clamp "$PILOT_WP_EPG_LIMIT" 20)
+    nok=0 nfail=0
+    for (( i = 0; i < ${#ids[@]}; i += batch )); do
+        (( i > 0 )) && sleep 0.3
+        csv=$(IFS=,; echo "${ids[*]:i:batch}")
+        if resp=$(call_api GET "${EPG_URL}&channels=${csv}&limit=${limit}") \
+           && jq -e '.data | type == "array"' <<<"$resp" >/dev/null 2>&1; then
+            jq -c '.data[]' <<<"$resp" >> "$work/epg.jsonl"
+            nok=$((nok + 1))
+        else
+            nfail=$((nfail + 1))
+            err=$(jq -rc '._meta.error // empty' <<<"${resp:-}" 2>/dev/null || true)
+            warn "EPG request for channels ${csv} failed${err:+: $err}"
+        fi
+    done
+    if (( nok == 0 )); then
+        echo "pilot-wp-epg: every EPG request failed; nothing written" >&2
+        exit 5
+    fi
+fi
+
+# --- Render XMLTV -------------------------------------------------------------
+# One jq pass. @html escapes & < > ' " (valid XML text and attribute values);
+# control characters XML 1.0 forbids are stripped first. API times are UTC
+# ("2026-05-31T09:00:00Z") → XMLTV "20260531090000 +0000". Programme child
+# order follows the XMLTV DTD (title, desc, category, icon, rating).
+jq -n -r --slurpfile ch "$work/lineup.json" --slurpfile epg "$work/epg.jsonl" "$JQ_LINEUP_DEFS"'
+def clean: tostring | gsub("[\\x00-\\x08\\x0B\\x0C\\x0E-\\x1F]"; "") | gsub("^\\s+|\\s+$"; "");
+def x: clean | @html;
+def present: . != null and (clean | length) > 0;
+def ts: (clean | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601 | strftime("%Y%m%d%H%M%S")) + " +0000";
+
+[$ch[0] | lineup | {id: (.id | tostring), xid: xmltv_id, name: .name,
+                    icon: (.icon.dark // .thumbnail)}] as $chs
+| ($epg | map({key: (.channel_id | tostring), value: (.entries // [])}) | from_entries) as $guide
+| "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+  "<!DOCTYPE tv SYSTEM \"xmltv.dtd\">",
+  "<tv source-info-url=\"https://pilot.wp.pl\" source-info-name=\"Pilot WP\" generator-info-name=\"pilot-wp-cli\">",
+  ( $chs[]
+    | "  <channel id=\"\(.xid | x)\">",
+      "    <display-name lang=\"pl\">\(.name | x)</display-name>",
+      (select(.icon | present) | "    <icon src=\"\(.icon | x)\"/>"),
+      "  </channel>" ),
+  ( $chs[] as $c
+    | ($guide[$c.id] // []) | sort_by(.start)[]
+    | select((.start | present) and (.end | present) and (.title | present))
+    | (try {start: (.start | ts), stop: (.end | ts)} catch null) as $t
+    | select($t != null)
+    | ([.description, .episode_description] | map(select(present) | clean)
+       | if length == 2 and .[0] == .[1] then .[:1] else . end | join("\n\n")) as $desc
+    | "  <programme start=\"\($t.start)\" stop=\"\($t.stop)\" channel=\"\($c.xid | x)\">",
+      "    <title lang=\"pl\">\(.title | x)</title>",
+      (select($desc != "") | "    <desc lang=\"pl\">\($desc | @html)</desc>"),
+      (select(.category | present) | "    <category lang=\"pl\">\(.category | x)</category>"),
+      (select(.photo | present) | "    <icon src=\"\(.photo | x)\"/>"),
+      (select((.ageRestriction // "" | tostring) | test("^[0-9]+$"))
+        | "    <rating system=\"PL\">\n      <value>\(.ageRestriction | x)</value>\n    </rating>"),
+      "  </programme>" ),
+  "</tv>"
+' > "$work/guide.xml"
+
+nchan=$(grep -c '^  <channel ' "$work/guide.xml" || true)
+nprog=$(grep -c '^  <programme ' "$work/guide.xml" || true)
+
+# --- Deliver ------------------------------------------------------------------
+if [[ "$OUT" == - ]]; then
+    cat "$work/guide.xml"
+else
+    mkdir -p "$(dirname -- "$OUT")"
+    tmp=$(mktemp "$OUT.XXXXXX")
+    cat "$work/guide.xml" > "$tmp"
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$OUT"
+fi
+
+dest=""
+[[ "$OUT" != - ]] && dest=" -> $OUT"
+if [[ "$MODE" == guide ]]; then
+    log "$nchan channels, $nprog programmes ($nok of $((nok + nfail)) requests ok)$dest"
+else
+    log "$nchan channels$dest"
+fi

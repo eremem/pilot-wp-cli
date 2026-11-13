@@ -25,9 +25,8 @@ source "$_self_dir/pilot-wp-common.sh"
 
 resolve_auth
 
-channels_json=$(call_api GET "$CHANNELS_URL")
-jq -e '.data | type == "array"' <<<"$channels_json" >/dev/null \
-    || { echo "channels/list returned non-array; check creds" >&2; exit 4; }
+channels_json=$(fetch_lineup) \
+    || { echo "channels/list returned no channel list; check creds / connectivity" >&2; exit 4; }
 
 # Prefer the invoked (logical) dir so a symlinked suite dir stays in the M3U
 # and switching the symlink switches versions; fall back to the resolved dir
@@ -81,14 +80,14 @@ else
         done < "$PILOT_WP_M3U_CACHE"
     fi
 
-    # Current subscribed channels + per-channel concurrency limit (same predicate
-    # as the M3U body so the two never drift).
+    # Current subscribed channels + per-channel concurrency limit (the shared
+    # lineup predicate, as in the M3U body, so the two never drift).
     declare -A _sub=()
     while IFS=$'\t' read -r _cid _lim; do
         _lim=${_lim%$'\r'}; [[ "$_lim" =~ ^[0-9]+$ ]] || _lim=1
         [[ "$_cid" =~ ^[0-9]+$ ]] && _sub[$_cid]=$_lim
-    done < <(jq -r '.data[] | select(.access_status != "unsubscribed")
-                    | "\(.id)\t\(.multiroom_local_limit // 1)"' <<<"$channels_json")
+    done < <(jq -r "$JQ_LINEUP_DEFS"'
+                    lineup | "\(.id)\t\(.multiroom_local_limit // 1)"' <<<"$channels_json")
 
     # Subscribed channels needing a (re)probe: unknown, expired, or forced;
     # ordered by DESCENDING local_limit (fragile limit=1 channels last).
@@ -157,13 +156,15 @@ printf '#EXTM3U\n' > "$tmp"
 # Extract every field we need in one jq pass (v3 channels/list schema).
 #
 # Per channel we emit one TSV row:
-#   id, name, slug, position, icon_dark, thumbnail,
+#   id, name, tvg_id, position, icon_dark, thumbnail,
 #   quality (HD/SD), audio_flag (1/0), primary_category, all_categories_csv
 #
 # Notes on the jq pipeline:
 # - category ids are resolved against the API's _meta.categories, so this
 #   script doesn't hardcode the id→Polish-name mapping.
-# - the only filter is access_status != "unsubscribed".
+# - the channel set (lineup) and tvg_id (xmltv_id) come from the library's
+#   JQ_LINEUP_DEFS, shared with pilot-wp-epg so the XMLTV guide binds to these
+#   exact entries. The only filter is access_status != "unsubscribed".
 # - logo = icon.dark (transparent), thumbnail as the fallback; v3 has no
 #   per-channel country, so no tvg-country is emitted.
 # - quality is the v3 "HD"/"SD" string. is_audio_only → "1"/"0" flag: radio="true"
@@ -173,7 +174,7 @@ printf '#EXTM3U\n' > "$tmp"
 #   the primary stays in the list so each category surfaces as a tvh tag.
 # Fields carry fallbacks so none is empty: the IFS=$'\t' read below would
 # collapse an empty column (tab is IFS whitespace).
-jq -r '
+jq -r "$JQ_LINEUP_DEFS"'
     # channels/list returns _meta.categories as an array of {id,name} (the
     # favourites endpoint uses an {id: name} object); normalise both to an
     # {idString: name} lookup.
@@ -181,13 +182,12 @@ jq -r '
     | (if ($raw | type) == "array"
          then (($raw | map({(.id|tostring): .name})) | add // {})
          else $raw end) as $cats
-    | .data[]
-    | select(.access_status != "unsubscribed")
+    | lineup
     | (.categories // []) as $catids
     | [
         (.id | tostring),
         .name,
-        (.slug // .name),
+        xmltv_id,
         (.position | tostring),
         (.icon.dark // .thumbnail),
         (.thumbnail // .icon.dark),
@@ -198,15 +198,13 @@ jq -r '
       ]
     | @tsv
 ' <<<"$channels_json" |
-while IFS=$'\t' read -r id name slug position icon thumbnail quality audio_flag primary_cat all_cats; do
+while IFS=$'\t' read -r id name tvg_id position icon thumbnail quality audio_flag primary_cat all_cats; do
     # Strip a CRLF \r (Windows-built jq / CRLF captures) from the last field;
     # it would otherwise break the tag dedupe ("Radio" vs "Radio\r").
     all_cats=${all_cats%$'\r'}
-    # tvg-id is an xmltv channel match key (tvheadend stores it as
-    # mm_iptv_epgid and binds xmltv <channel id="..."> against it). The
-    # external xmltv this deployment consumes keys channels by display name,
-    # so name is primary; slug is only used if name is somehow empty.
-    tvg_id="${name:-$slug}"
+    # tvg_id is the XMLTV channel match key (tvheadend stores it as
+    # mm_iptv_epgid and binds xmltv <channel id="..."> against it); derived by
+    # the library's xmltv_id, which pilot-wp-epg uses for its <channel id>.
     # group-title takes the primary (first) category; tvh-tags below carries
     # the full list.
     [[ -z "$primary_cat" ]] && primary_cat="Inne"

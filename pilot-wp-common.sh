@@ -75,7 +75,16 @@ FAVOURITES_URL="${BASE_URL}/api/v3/channels/favourites?device_type=${DEVICE_TYPE
 # FAVOURITES_URL above, but add/remove are v1.
 FAVOURITES_EDIT_URL="${BASE_URL}/api/v1/channels/favourites?device_type=${DEVICE_TYPE}"
 VIDEO_URL="${BASE_URL}/api/v3/channel/"
+# Programme guide (used by pilot-wp-epg). Takes only channels=<id,…> and
+# limit=N — no date/offset/paging parameter exists (unknown ones are silently
+# ignored), and it serves no past programmes. Server-side caps: ≤20 entries per
+# channel, ≤~12 h ahead of now, ≤50 channels per request (extra ids are dropped
+# without an error). Omitting limit is an invalid_payload error.
 EPG_URL="${BASE_URL}/api/v2/epg?device_type=${DEVICE_TYPE}"
+# Channels per /api/v2/epg request (the web client uses 20; capped at 50) and
+# programmes per channel (capped at 20) — see pilot-wp-epg.
+: "${PILOT_WP_EPG_BATCH:=20}"
+: "${PILOT_WP_EPG_LIMIT:=20}"
 # Pure stream close (releases a slot without opening a new session, unlike the
 # ?close_stream= "switch" GET). POST body {"token":…}; returns
 # {"data":{"status":"ok"}}. The web client's stop-playback call; used on teardown
@@ -342,6 +351,33 @@ cookies_as_header() {
 # Some jq builds (notably the Windows binary used on the dev MSYS host) emit
 # CRLF; a trailing \r breaks downstream matching/arithmetic. No-op on Linux.
 jqr() { jq -r "$@" | tr -d '\r'; }
+
+# --- Channel lineup (shared by pilot-wp-m3u and pilot-wp-epg) -----------------
+# JQ_LINEUP_DEFS is prepended to a jq program run against the channels/list
+# response, so the M3U and the XMLTV guide always cover the same channels and
+# use the same channel key:
+#   lineup    — every channel the account can play (free or subscribed): the
+#               only filter is access_status != "unsubscribed".
+#   xmltv_id  — the M3U tvg-id == the XMLTV <channel id>. tvheadend stores the
+#               tvg-id as the IPTV service's EPG id and binds an XMLTV channel
+#               with the same id to it, so the two must be derived identically.
+#               The channel name (what external XMLTV sources key on); the slug
+#               only if the name is empty.
+JQ_LINEUP_DEFS='
+def lineup: .data[] | select(.access_status != "unsubscribed");
+def xmltv_id: if (.name // "") != "" then .name else (.slug // "") end;
+'
+
+# --- fetch_lineup -------------------------------------------------------------
+# Prints the /api/v3/channels/list response (filter it with JQ_LINEUP_DEFS'
+# lineup). Returns 2 on a transport failure, 1 if the reply has no channel
+# array (typically an expired session).
+fetch_lineup() {
+    local json
+    json=$(call_api GET "$CHANNELS_URL") || return 2
+    jq -e '.data | type == "array"' <<<"$json" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$json"
+}
 
 # --- switch_close_url CHANNEL_ID TOKEN ----------------------------------------
 # The Pilot WP "switch" GET: closes the session identified by TOKEN and, as a

@@ -7,6 +7,7 @@ A set of scripts that let you watch [Pilot WP](https://pilot.wp.pl) channels on 
 What you get:
 
 - **A channel list for tvheadend** — with logos, grouped by category. It includes the free channels and the ones your subscription covers.
+- **A TV guide (EPG)** for those channels — titles, descriptions, pictures and age ratings (see [TV guide](#optional-tv-guide-epg)).
 - **Picture and sound in their original quality** — streams are never re-encoded, and every audio track is kept.
 - **A clear message instead of an error** — when a channel can't be played (e.g. your account's limit of simultaneous streams is reached), an information screen explains why.
 - **Optionally: DRM-protected channels** (e.g. TVN) — if you provide your own Widevine device file (see [DRM channels](#optional-drm-channels)).
@@ -23,6 +24,7 @@ What you get:
 - [Step 5. Create the channel list](#step-5-create-the-channel-list)
 - [Step 6. Add the channels to tvheadend](#step-6-add-the-channels-to-tvheadend)
 - [Step 7. Keep the session from expiring](#step-7-keep-the-session-from-expiring)
+- [Optional: TV guide (EPG)](#optional-tv-guide-epg)
 - [Optional: DRM channels](#optional-drm-channels)
 - [Optional: refreshing the channel list automatically](#optional-refreshing-the-channel-list-automatically)
 - [Common problems](#common-problems)
@@ -207,6 +209,25 @@ and add this line at the end:
 
 `pilot-wp-ping` doesn't count towards your stream limit and prints nothing when all is well. If the session expires anyway, simply connect your account again.
 
+## Optional: TV guide (EPG)
+
+The scripts can also supply the TV guide for the channels on your list. Pilot WP only publishes about 12 hours ahead, so tvheadend fetches it by itself every few hours and keeps what it has already received.
+
+1. **On the server:** let tvheadend find the guide script, then restart tvheadend (e.g. `sudo systemctl restart tvheadend`, or reboot the server):
+
+   ```bash
+   sudo ln -s /home/xbian/.hts/tvheadend/scripts/pilot-wp-cli/pilot-wp-epg /usr/bin/tv_grab_pilotwp
+   ```
+
+2. **In the tvheadend web interface:** go to **Configuration** → **Channel / EPG** → **EPG Grabber Modules**, select **Internal: XMLTV: Pilot WP**, tick **Enabled**, and click **Save**.
+3. Go to **Configuration** → **Channel / EPG** → **EPG Grabber**. In the **Cron multi-line** box, replace the schedule with the line below (every 6 hours), click **Save**, and then **Re-run internal EPG grabbers**:
+
+   ```cron
+   4 */6 * * *
+   ```
+
+After a minute or two, the guide shows up in tvheadend and in Kodi. Radio stations and some music channels have no guide.
+
 ## Optional: DRM channels
 
 Some channels (e.g. TVN) are protected with Widevine DRM. By default, an information screen is shown in their place. To watch them, you need your own **Widevine L3 device file** (`.wvd`). The project doesn't include one — you create it yourself from an Android emulator running on your own computer, and you alone are responsible for using it lawfully (see the [disclaimer](DISCLAIMER.md)).
@@ -267,7 +288,7 @@ That's why we recommend creating the list by hand ([step 5](#step-5-create-the-c
 - **No channels in tvheadend** — check that the list's address has three slashes (`file:///…`) and that `channels.m3u` exists and belongs to the tvheadend user, then run **Force Scan** and **Map services** again (step 6).
 - **The picture stutters** — increase the amount of data the scripts fetch ahead. In `config.env` (create it as in the DRM section, item 3), replace the line `#PILOT_WP_DASHLIVE_ARGS=` with `PILOT_WP_DASHLIVE_ARGS="--prebuffer 30"`. On a slow connection, you can also lower the picture quality: `PILOT_WP_DASHLIVE_ARGS="--prebuffer 30 --max-video-bw 4000000"`.
 - **A radio channel is listed among the TV channels** — see the note on radio channels in [step 6](#step-6-add-the-channels-to-tvheadend).
-- **No TV guide (EPG)** — the scripts don't provide a programme guide. You can connect an external EPG source (XMLTV) in tvheadend.
+- **No TV guide (EPG)** — set it up as described in [TV guide](#optional-tv-guide-epg). If **Internal: XMLTV: Pilot WP** isn't on the list of modules, check the `tv_grab_pilotwp` link and restart tvheadend. `sudo -u xbian ./pilot-wp-epg >/dev/null` shows how many channels and programmes were fetched, or what went wrong. If you created the channel list a long time ago and a channel has since been renamed, create the list again ([step 5](#step-5-create-the-channel-list)) — the guide is matched to channels by name.
 - **The login page won't open** — your computer must be on the same home network as the server. Make sure you're using the address printed in the terminal, and that the server's firewall allows port `8199` (you can choose a different port with `--port`).
 - **"Permission denied" when running the scripts** — the scripts have lost their executable flag, e.g. when copied from Windows. Run `sudo chmod +x pilot-wp-*` again.
 
